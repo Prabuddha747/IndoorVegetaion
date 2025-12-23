@@ -28,7 +28,8 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Streamlit
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 
 # Data (uncomment if dataset is large)
 # data/*.xlsx
