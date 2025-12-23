@@ -1,0 +1,48 @@
+{
+  "pH": {
+    "mean": 5.6078301260783014,
+    "median": 5.7,
+    "std": 0.5680587436823468,
+    "min": 3.0,
+    "max": 9.0,
+    "optimal_range_pct": 27.03573798464309,
+    "acidic_pct": 72.82206844250639,
+    "alkaline_pct": 0.14219357285050716,
+    "skewness": -0.20372513406264955,
+    "recommendations": [
+      "\u26a0\ufe0f **Dataset Analysis**: 72.8% of samples are acidic (pH < 6.0). Your dataset shows mean pH of 5.61, indicating systematic acidity issues.",
+      "\ud83d\udcca **Pattern Found**: pH ranges from 3.00 to 9.00. Consider bulk lime application across 73% of affected areas.",
+      "\ud83d\udd17 **Correlation Insight**: pH shows strongest correlation with moisture (r=-0.566). Monitoring moisture can help predict pH changes."
+    ]
+  },
+  "NHI": {
+    "mean": 3.307873717564092,
+    "median": 0.2249357326478149,
+    "std": 5.841886690852346,
+    "min": 0.0,
+    "max": 100.0,
+    "optimal_pct": 0.023698928808417858,
+    "good_pct": 0.0,
+    "warning_pct": 0.0,
+    "critical_pct": 99.97630107119159,
+    "recommendations": [
+      "\ud83d\udd34 **Dataset Analysis**: 100.0% of samples are in critical range (NHI < 30). Mean NHI of 3.31 indicates widespread nutrient deficiencies requiring immediate intervention.",
+      "\ud83d\udcca **NPK Imbalance**: Nitrogen represents 9.3% of total NPK (below ideal ~40%). Consider increasing N applications."
+    ]
+  },
+  "growth_stage": {
+    "distribution": {
+      "Vegetative Growth": 15235,
+      "Seedling ": 5863
+    },
+    "distribution_pct": {
+      "Vegetative Growth": 72.21063607924921,
+      "Seedling ": 27.78936392075078
+    },
+    "recommendations": [
+      "\ud83d\udcca **Vegetative Growth Stage** (72.2% of dataset): Avg N=6.8, P=34.3, K=30.1. Dataset shows 15235 samples in this stage.",
+      "\ud83d\udcca **Seedling  Stage** (27.8% of dataset): Avg N=5.6, P=33.0, K=28.7. Dataset shows 5863 samples in this stage.",
+      "\ud83c\udf31 **Dataset Pattern**: Vegetative Growth is the dominant stage (72.2% of samples). Focus nutrient management strategies on this stage's requirements."
+    ]
+  }
+}
