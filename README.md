@@ -380,8 +380,4 @@ For questions or issues, please refer to the project documentation or create an 
 - scikit-learn for preprocessing and evaluation metrics
 - All open-source contributors to the libraries used in this project
 
----
-
-**Last Updated**: 2024
-**Version**: 1.0.0
 
