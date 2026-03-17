@@ -35,7 +35,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, classification_report
+    confusion_matrix, classification_report, roc_auc_score
 )
 import joblib
 
@@ -330,10 +330,113 @@ for epoch in range(50):
 lstm_classifier.eval()
 X_te_t = torch.tensor(X_te_lstm, dtype=torch.float32).to(device)
 with torch.no_grad():
-    logits = lstm_classifier(X_te_t)
-    y_pred_lstm = torch.argmax(logits, dim=1).cpu().numpy()
+    logits_lstm = lstm_classifier(X_te_t)
+    y_proba_lstm = torch.softmax(logits_lstm, dim=1).cpu().numpy()
+    y_pred_lstm = np.argmax(y_proba_lstm, axis=1)
 
 torch.save(lstm_classifier.state_dict(), f"{MODELS_DIR}/growth_stage_lstm.pt")
+
+# ===============================
+# GRU Classifier
+# ===============================
+
+print("\n" + "="*60)
+print("Training GRU Classifier for Growth Stage...")
+print("="*60)
+
+class GRUClassifier(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2, num_classes=n_classes):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, num_classes)
+
+    def forward(self, x):
+        _, h = self.gru(x)
+        return self.fc(h[-1])
+
+gru_classifier = GRUClassifier(X_tr_lstm.shape[2]).to(device)
+optimizer_gru = torch.optim.Adam(gru_classifier.parameters(), lr=0.001)
+
+X_tr_t = torch.tensor(X_tr_lstm, dtype=torch.float32).to(device)
+y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.long).to(device)
+
+gru_classifier.train()
+for epoch in range(50):
+    optimizer_gru.zero_grad()
+    preds = gru_classifier(X_tr_t)
+    loss = criterion(preds, y_tr_t)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(gru_classifier.parameters(), 1.0)
+    optimizer_gru.step()
+    if (epoch + 1) % 10 == 0:
+        print(f"[GRU] Epoch {epoch+1}/50, Loss: {loss.item():.4f}")
+
+gru_classifier.eval()
+X_te_t = torch.tensor(X_te_lstm, dtype=torch.float32).to(device)
+with torch.no_grad():
+    logits_gru = gru_classifier(X_te_t)
+    y_proba_gru = torch.softmax(logits_gru, dim=1).cpu().numpy()
+    y_pred_gru = np.argmax(y_proba_gru, axis=1)
+
+torch.save(gru_classifier.state_dict(), f"{MODELS_DIR}/growth_stage_gru.pt")
+
+# ===============================
+# Autoencoder + Classifier (supervised)
+# ===============================
+
+print("\n" + "="*60)
+print("Training Autoencoder + Classifier for Growth Stage...")
+print("="*60)
+
+class AutoencoderClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes, latent_dim=16, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.head = nn.Linear(latent_dim, num_classes)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        logits = self.head(z)
+        return x_hat, logits
+
+ae_classifier = AutoencoderClassifier(input_dim=X_train_s.shape[1], num_classes=n_classes).to(device)
+opt_ae = torch.optim.Adam(ae_classifier.parameters(), lr=0.001)
+mse = nn.MSELoss()
+ce = nn.CrossEntropyLoss()
+
+X_tr_ae = torch.tensor(X_train_s, dtype=torch.float32).to(device)
+y_tr_ae = torch.tensor(y_train_1d, dtype=torch.long).to(device)
+X_te_ae = torch.tensor(X_test_s, dtype=torch.float32).to(device)
+
+ae_classifier.train()
+alpha = 0.3
+for epoch in range(120):
+    opt_ae.zero_grad()
+    x_hat, logits = ae_classifier(X_tr_ae)
+    loss_recon = mse(x_hat, X_tr_ae)
+    loss_cls = ce(logits, y_tr_ae)
+    loss = loss_recon + alpha * loss_cls
+    loss.backward()
+    opt_ae.step()
+
+ae_classifier.eval()
+with torch.no_grad():
+    _, logits_ae = ae_classifier(X_te_ae)
+    y_proba_ae = torch.softmax(logits_ae, dim=1).cpu().numpy()
+    y_pred_ae = np.argmax(y_proba_ae, axis=1)
+
+torch.save(ae_classifier.state_dict(), f"{MODELS_DIR}/growth_stage_autoencoder.pt")
 
 # ===============================
 # TCN Classifier
@@ -390,8 +493,9 @@ for epoch in range(50):
 tcn_classifier.eval()
 X_te_t = torch.tensor(X_te_tcn, dtype=torch.float32).to(device)
 with torch.no_grad():
-    logits = tcn_classifier(X_te_t)
-    y_pred_tcn = torch.argmax(logits, dim=1).cpu().numpy()
+    logits_tcn = tcn_classifier(X_te_t)
+    y_proba_tcn = torch.softmax(logits_tcn, dim=1).cpu().numpy()
+    y_pred_tcn = np.argmax(y_proba_tcn, axis=1)
 
 torch.save(tcn_classifier.state_dict(), f"{MODELS_DIR}/growth_stage_tcn.pt")
 
@@ -418,27 +522,100 @@ else:
     # Fallback: use validation split
     y_test_seq_lstm = y_te_lstm
 
+
+def _fpr_fnr_macro(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+    fprs = []
+    fnrs = []
+    for c in range(n_classes):
+        tp = cm[c, c]
+        fn = cm[c, :].sum() - tp
+        fp = cm[:, c].sum() - tp
+        tn = cm.sum() - (tp + fn + fp)
+        fpr = (fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+        fnr = (fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+        fprs.append(fpr)
+        fnrs.append(fnr)
+    return float(np.mean(fprs)), float(np.mean(fnrs))
+
+
+def _roc_auc_ovr_macro(y_true: np.ndarray, y_proba: np.ndarray, n_classes: int):
+    try:
+        if y_proba is None or y_proba.ndim != 2 or y_proba.shape[1] != n_classes:
+            return float("nan")
+        # For binary, roc_auc_score expects scores for the positive class or shape (n,2)
+        if n_classes == 2:
+            return float(roc_auc_score(y_true, y_proba[:, 1]))
+        return float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro"))
+    except Exception:
+        return float("nan")
+
+
+# TabNet probabilities for AUC/FPR/FNR
+y_proba_tabnet = tabnet_classifier.predict_proba(X_test_s)
+
+fpr_tabnet, fnr_tabnet = _fpr_fnr_macro(y_test, y_pred_tabnet, n_classes)
+fpr_lstm, fnr_lstm = _fpr_fnr_macro(y_te_lstm, y_pred_lstm, n_classes)
+fpr_gru, fnr_gru = _fpr_fnr_macro(y_te_lstm, y_pred_gru, n_classes)
+fpr_tcn, fnr_tcn = _fpr_fnr_macro(y_te_tcn, y_pred_tcn, n_classes)
+fpr_ae, fnr_ae = _fpr_fnr_macro(y_test, y_pred_ae, n_classes)
+
+auc_tabnet = _roc_auc_ovr_macro(y_test, y_proba_tabnet, n_classes)
+auc_lstm = _roc_auc_ovr_macro(y_te_lstm, y_proba_lstm, n_classes)
+auc_gru = _roc_auc_ovr_macro(y_te_lstm, y_proba_gru, n_classes)
+auc_tcn = _roc_auc_ovr_macro(y_te_tcn, y_proba_tcn, n_classes)
+auc_ae = _roc_auc_ovr_macro(y_test, y_proba_ae, n_classes)
+
 comparison_df = pd.DataFrame({
-    "Model": ["TabNet", "LSTM", "TCN"],
+    "Model": ["TabNet", "LSTM", "GRU", "TCN", "Autoencoder"],
     "Accuracy": [
         accuracy_score(y_test, y_pred_tabnet),
         accuracy_score(y_te_lstm, y_pred_lstm),
+        accuracy_score(y_te_lstm, y_pred_gru),
         accuracy_score(y_te_tcn, y_pred_tcn)
+        , accuracy_score(y_test, y_pred_ae)
     ],
     "Precision": [
         precision_score(y_test, y_pred_tabnet, average='weighted', zero_division=0),
         precision_score(y_te_lstm, y_pred_lstm, average='weighted', zero_division=0),
+        precision_score(y_te_lstm, y_pred_gru, average='weighted', zero_division=0),
         precision_score(y_te_tcn, y_pred_tcn, average='weighted', zero_division=0)
+        , precision_score(y_test, y_pred_ae, average='weighted', zero_division=0)
     ],
     "Recall": [
         recall_score(y_test, y_pred_tabnet, average='weighted', zero_division=0),
         recall_score(y_te_lstm, y_pred_lstm, average='weighted', zero_division=0),
+        recall_score(y_te_lstm, y_pred_gru, average='weighted', zero_division=0),
         recall_score(y_te_tcn, y_pred_tcn, average='weighted', zero_division=0)
+        , recall_score(y_test, y_pred_ae, average='weighted', zero_division=0)
     ],
     "F1-Score": [
         f1_score(y_test, y_pred_tabnet, average='weighted', zero_division=0),
         f1_score(y_te_lstm, y_pred_lstm, average='weighted', zero_division=0),
+        f1_score(y_te_lstm, y_pred_gru, average='weighted', zero_division=0),
         f1_score(y_te_tcn, y_pred_tcn, average='weighted', zero_division=0)
+        , f1_score(y_test, y_pred_ae, average='weighted', zero_division=0)
+    ],
+    "ROC AUC": [
+        auc_tabnet,
+        auc_lstm,
+        auc_gru,
+        auc_tcn,
+        auc_ae
+    ],
+    "FPR": [
+        fpr_tabnet,
+        fpr_lstm,
+        fpr_gru,
+        fpr_tcn,
+        fpr_ae
+    ],
+    "FNR": [
+        fnr_tabnet,
+        fnr_lstm,
+        fnr_gru,
+        fnr_tcn,
+        fnr_ae
     ]
 })
 
@@ -468,9 +645,9 @@ imp_df.to_csv(f"{METRICS_DIR}/growth_stage_feature_importance.csv", index=False)
 plt.figure(figsize=(14, 5))
 metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
 x = np.arange(len(metrics))
-width = 0.25
+width = 0.17
 
-for i, model in enumerate(['TabNet', 'LSTM', 'TCN']):
+for i, model in enumerate(['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']):
     values = [
         comparison_df[comparison_df['Model'] == model]['Accuracy'].values[0],
         comparison_df[comparison_df['Model'] == model]['Precision'].values[0],
@@ -490,10 +667,10 @@ plt.savefig(f"{PLOTS_DIR}/growth_stage_model_comparison.png", dpi=300)
 plt.close()
 
 # Confusion matrices
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-predictions = [y_pred_tabnet, y_pred_lstm, y_pred_tcn]
-targets = [y_test, y_te_lstm, y_te_tcn]
-model_names = ['TabNet', 'LSTM', 'TCN']
+fig, axes = plt.subplots(1, 5, figsize=(22, 4))
+predictions = [y_pred_tabnet, y_pred_lstm, y_pred_gru, y_pred_tcn, y_pred_ae]
+targets = [y_test, y_te_lstm, y_te_lstm, y_te_tcn, y_test]
+model_names = ['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']
 
 for i, (pred, target, name) in enumerate(zip(predictions, targets, model_names)):
     cm = confusion_matrix(target, pred)
@@ -526,17 +703,6 @@ def predict_growth_stage(sensor_input: dict):
     x = scaler.transform(df_in)
     pred_encoded = tabnet_classifier.predict(x)[0][0]
     return le.inverse_transform([pred_encoded])[0]
-
-# Generate dataset-specific insights
-try:
-    from data_insights import analyze_dataset_insights
-    print("\n" + "="*60)
-    print("Generating Dataset-Specific Insights...")
-    print("="*60)
-    insights = analyze_dataset_insights(df)
-    print("Dataset insights saved to:", os.path.join(METRICS_DIR, "dataset_insights.json"))
-except ImportError:
-    print("Note: data_insights module not available. Install required dependencies.")
 
 print("\n" + "="*60)
 print("Plant Growth Stage Classification Analysis Complete!")

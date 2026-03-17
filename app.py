@@ -18,6 +18,149 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+# -------------------------------
+# Torch model definitions (for loading inference weights)
+# -------------------------------
+
+class LSTMRegressor(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1])
+
+
+class GRURegressor(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        _, h = self.gru(x)
+        return self.fc(h[-1])
+
+
+class TCNRegressor(nn.Module):
+    def __init__(self, input_size, channels=64, kernel=3, num_layers=2):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_channels = input_size if i == 0 else channels
+            layers.append(weight_norm(nn.Conv1d(in_channels, channels, kernel, padding=kernel // 2)))
+            layers.append(nn.ReLU())
+        self.conv_layers = nn.Sequential(*layers)
+        self.fc = nn.Linear(channels, 1)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.conv_layers(x)
+        x = x.mean(dim=2)
+        return self.fc(x)
+
+
+class TCNRegressorSingle(nn.Module):
+    def __init__(self, input_size, channels=64, kernel=3):
+        super().__init__()
+        self.conv = weight_norm(nn.Conv1d(input_size, channels, kernel, padding=kernel // 2))
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(channels, 1)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.relu(self.conv(x))
+        x = x.mean(dim=2)
+        return self.fc(x)
+
+
+class AutoencoderRegressor(nn.Module):
+    def __init__(self, input_dim, latent_dim=16, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.head = nn.Linear(latent_dim, 1)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        y_hat = self.head(z)
+        return x_hat, y_hat
+
+
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2, num_classes=3):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, num_classes)
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1])
+
+
+class GRUClassifier(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2, num_classes=3):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, num_classes)
+
+    def forward(self, x):
+        _, h = self.gru(x)
+        return self.fc(h[-1])
+
+
+class TCNClassifier(nn.Module):
+    def __init__(self, input_size, channels=64, kernel=3, num_layers=2, num_classes=3):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_channels = input_size if i == 0 else channels
+            layers.append(weight_norm(nn.Conv1d(in_channels, channels, kernel, padding=kernel // 2)))
+            layers.append(nn.ReLU())
+        self.conv_layers = nn.Sequential(*layers)
+        self.fc = nn.Linear(channels, num_classes)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.conv_layers(x)
+        x = x.mean(dim=2)
+        return self.fc(x)
+
+
+class AutoencoderClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes=3, latent_dim=16, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.head = nn.Linear(latent_dim, num_classes)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        logits = self.head(z)
+        return x_hat, logits
+
 # Import dataset insights module
 try:
     from data_insights import analyze_dataset_insights, generate_dataset_recommendations
@@ -112,11 +255,272 @@ def load_models():
                 models['growth_stage_tabnet'].load_model(growth_model_path)
         except Exception as e:
             st.warning(f"TabNet models not loaded: {e}")
+
+        # Load PyTorch models (LSTM/GRU/TCN/Autoencoder)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        models["torch_device"] = device
+
+        def _load_state(model, path):
+            state = torch.load(path, map_location=device)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        def _rnn_layers_from_state(state: dict) -> int:
+            # Works for both LSTM and GRU state dicts.
+            # If layer 1 weights exist, model was trained with >=2 layers.
+            return 2 if any("weight_ih_l1" in k for k in state.keys()) else 1
+
+        def _load_lstm_regressor(path: str, input_dim: int):
+            state = torch.load(path, map_location=device)
+            num_layers = _rnn_layers_from_state(state)
+            model = LSTMRegressor(input_dim, num_layers=num_layers)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        def _load_gru_regressor(path: str, input_dim: int):
+            state = torch.load(path, map_location=device)
+            num_layers = _rnn_layers_from_state(state)
+            model = GRURegressor(input_dim, num_layers=num_layers)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        def _load_tcn_regressor(path: str, input_dim: int):
+            state = torch.load(path, map_location=device)
+            if any(k.startswith("conv_layers.") for k in state.keys()):
+                model = TCNRegressor(input_dim, num_layers=2)
+            else:
+                model = TCNRegressorSingle(input_dim)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        # pH
+        ph_input_dim = 6
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_lstm.pt")):
+            models["ph_lstm"] = _load_lstm_regressor(os.path.join(MODELS_DIR, "ph_lstm.pt"), ph_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_gru.pt")):
+            models["ph_gru"] = _load_gru_regressor(os.path.join(MODELS_DIR, "ph_gru.pt"), ph_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_tcn.pt")):
+            models["ph_tcn"] = _load_tcn_regressor(os.path.join(MODELS_DIR, "ph_tcn.pt"), ph_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_autoencoder.pt")):
+            models["ph_autoencoder"] = _load_state(AutoencoderRegressor(ph_input_dim), os.path.join(MODELS_DIR, "ph_autoencoder.pt"))
+
+        # NHI
+        nhi_input_dim = 7
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_lstm.pt")):
+            models["nhi_lstm"] = _load_lstm_regressor(os.path.join(MODELS_DIR, "nhi_lstm.pt"), nhi_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_gru.pt")):
+            models["nhi_gru"] = _load_gru_regressor(os.path.join(MODELS_DIR, "nhi_gru.pt"), nhi_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_tcn.pt")):
+            models["nhi_tcn"] = _load_tcn_regressor(os.path.join(MODELS_DIR, "nhi_tcn.pt"), nhi_input_dim)
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_autoencoder.pt")):
+            models["nhi_autoencoder"] = _load_state(AutoencoderRegressor(nhi_input_dim), os.path.join(MODELS_DIR, "nhi_autoencoder.pt"))
+
+        # Growth stage
+        stage_input_dim = 7
+        n_stage_classes = 3
+        if "growth_stage_encoder" in models:
+            try:
+                n_stage_classes = len(models["growth_stage_encoder"].classes_)
+            except Exception:
+                n_stage_classes = 3
+
+        if os.path.exists(os.path.join(MODELS_DIR, "growth_stage_lstm.pt")):
+            models["growth_stage_lstm"] = _load_state(
+                LSTMClassifier(stage_input_dim, num_classes=n_stage_classes),
+                os.path.join(MODELS_DIR, "growth_stage_lstm.pt"),
+            )
+        if os.path.exists(os.path.join(MODELS_DIR, "growth_stage_gru.pt")):
+            models["growth_stage_gru"] = _load_state(
+                GRUClassifier(stage_input_dim, num_classes=n_stage_classes),
+                os.path.join(MODELS_DIR, "growth_stage_gru.pt"),
+            )
+        if os.path.exists(os.path.join(MODELS_DIR, "growth_stage_tcn.pt")):
+            models["growth_stage_tcn"] = _load_state(
+                TCNClassifier(stage_input_dim, num_classes=n_stage_classes),
+                os.path.join(MODELS_DIR, "growth_stage_tcn.pt"),
+            )
+        if os.path.exists(os.path.join(MODELS_DIR, "growth_stage_autoencoder.pt")):
+            models["growth_stage_autoencoder"] = _load_state(
+                AutoencoderClassifier(stage_input_dim, num_classes=n_stage_classes),
+                os.path.join(MODELS_DIR, "growth_stage_autoencoder.pt"),
+            )
             
     except Exception as e:
         st.error(f"Error loading models: {e}")
     
     return models
+
+
+def _as_sequence(x_2d: np.ndarray, seq_len: int) -> torch.Tensor:
+    # Repeat the single observation seq_len times so sequence models can run in the dashboard.
+    x = np.repeat(x_2d[np.newaxis, :, :], repeats=seq_len, axis=1)  # (1, seq, features)
+    return torch.tensor(x, dtype=torch.float32)
+
+
+def _create_sequences_np(X: np.ndarray, y: np.ndarray, seq_len: int):
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len):
+        Xs.append(X[i : i + seq_len])
+        ys.append(y[i + seq_len])
+    return np.asarray(Xs), np.asarray(ys)
+
+
+def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    mae = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - float(np.mean(y_true))) ** 2))
+    r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+    return mae, rmse, r2
+
+
+def _classification_fpr_fnr_macro(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
+    cm = np.zeros((n_classes, n_classes), dtype=np.int64)
+    for t, p in zip(y_true, y_pred):
+        if 0 <= int(t) < n_classes and 0 <= int(p) < n_classes:
+            cm[int(t), int(p)] += 1
+    fprs, fnrs = [], []
+    for c in range(n_classes):
+        tp = cm[c, c]
+        fn = int(cm[c, :].sum() - tp)
+        fp = int(cm[:, c].sum() - tp)
+        tn = int(cm.sum() - (tp + fn + fp))
+        fpr = (fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+        fnr = (fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+        fprs.append(fpr)
+        fnrs.append(fnr)
+    return float(np.mean(fprs)), float(np.mean(fnrs))
+
+
+def _classification_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    acc = float(np.mean(y_true == y_pred)) if len(y_true) else float("nan")
+
+    precision_sum = 0.0
+    recall_sum = 0.0
+    f1_sum = 0.0
+    support_sum = 0
+    for c in range(n_classes):
+        tp = int(np.sum((y_true == c) & (y_pred == c)))
+        fp = int(np.sum((y_true != c) & (y_pred == c)))
+        fn = int(np.sum((y_true == c) & (y_pred != c)))
+        support = int(np.sum(y_true == c))
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        precision_sum += prec * support
+        recall_sum += rec * support
+        f1_sum += f1 * support
+        support_sum += support
+    precision = precision_sum / support_sum if support_sum > 0 else float("nan")
+    recall = recall_sum / support_sum if support_sum > 0 else float("nan")
+    f1 = f1_sum / support_sum if support_sum > 0 else float("nan")
+    fpr, fnr = _classification_fpr_fnr_macro(y_true, y_pred, n_classes)
+    return acc, precision, recall, f1, fpr, fnr
+
+
+def _maybe_compute_growth_stage_metrics(df: pd.DataFrame, models: dict):
+    if df is None or "growth_stage_scaler" not in models or "growth_stage_encoder" not in models:
+        return None
+
+    features = ["nitrogen", "phosphorus", "potassium", "conductivity", "moisture", "temperature", "pH"]
+    if not all(f in df.columns for f in features):
+        return None
+
+    df_work = df.copy()
+    if "growth_stage" not in df_work.columns:
+        if "Plant Growth Stage" in df_work.columns:
+            df_work["growth_stage"] = df_work["Plant Growth Stage"].astype(str).str.strip()
+        else:
+            return None
+
+    df_clean = df_work[features + ["growth_stage"]].dropna().copy()
+    if df_clean.empty:
+        return None
+
+    le = models["growth_stage_encoder"]
+    try:
+        y_all = le.transform(df_clean["growth_stage"].astype(str).str.strip())
+    except Exception:
+        return None
+    n_classes = len(getattr(le, "classes_", [])) or int(np.max(y_all) + 1)
+
+    rng = np.random.RandomState(42)
+    idx = np.arange(len(df_clean))
+    rng.shuffle(idx)
+    split = int(0.8 * len(idx))
+    tr_idx, te_idx = idx[:split], idx[split:]
+    X_train = df_clean.iloc[tr_idx][features].values
+    X_test = df_clean.iloc[te_idx][features].values
+    y_test = np.asarray(y_all)[te_idx]
+
+    scaler = models["growth_stage_scaler"]
+    X_train_s = scaler.transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    rows = []
+
+    if "growth_stage_tabnet" in models:
+        try:
+            y_pred = models["growth_stage_tabnet"].predict(X_test_s).astype(int)
+            acc, prec, rec, f1, fpr, fnr = _classification_metrics(y_test, y_pred, n_classes)
+            rows.append({"Model": "TabNet", "Accuracy": acc, "Precision": prec, "Recall": rec, "F1-Score": f1, "ROC AUC": float("nan"), "FPR": fpr, "FNR": fnr})
+        except Exception:
+            pass
+
+    # LSTM/GRU (seq_len=10)
+    seq_len = 10
+    X_seq, y_seq = _create_sequences_np(X_train_s, np.asarray(y_all)[tr_idx], seq_len=seq_len)
+    if len(X_seq) > 0:
+        split2 = int(0.8 * len(X_seq))
+        X_te = X_seq[split2:]
+        y_te = y_seq[split2:]
+        x_t = torch.tensor(X_te, dtype=torch.float32)
+
+        def _seq_pred(model_key: str):
+            with torch.no_grad():
+                logits = models[model_key](x_t)
+                return torch.argmax(logits, dim=1).cpu().numpy().astype(int)
+
+        if "growth_stage_lstm" in models:
+            y_pred = _seq_pred("growth_stage_lstm")
+            acc, prec, rec, f1, fpr, fnr = _classification_metrics(y_te, y_pred, n_classes)
+            rows.append({"Model": "LSTM", "Accuracy": acc, "Precision": prec, "Recall": rec, "F1-Score": f1, "ROC AUC": float("nan"), "FPR": fpr, "FNR": fnr})
+        if "growth_stage_gru" in models:
+            y_pred = _seq_pred("growth_stage_gru")
+            acc, prec, rec, f1, fpr, fnr = _classification_metrics(y_te, y_pred, n_classes)
+            rows.append({"Model": "GRU", "Accuracy": acc, "Precision": prec, "Recall": rec, "F1-Score": f1, "ROC AUC": float("nan"), "FPR": fpr, "FNR": fnr})
+
+    # TCN (seq_len=5)
+    seq_len_tcn = 5
+    X_seq_t, y_seq_t = _create_sequences_np(X_train_s, np.asarray(y_all)[tr_idx], seq_len=seq_len_tcn)
+    if len(X_seq_t) > 0 and "growth_stage_tcn" in models:
+        split2 = int(0.8 * len(X_seq_t))
+        X_te = X_seq_t[split2:]
+        y_te = y_seq_t[split2:]
+        x_t = torch.tensor(X_te, dtype=torch.float32)
+        with torch.no_grad():
+            logits = models["growth_stage_tcn"](x_t)
+            y_pred = torch.argmax(logits, dim=1).cpu().numpy().astype(int)
+        acc, prec, rec, f1, fpr, fnr = _classification_metrics(y_te, y_pred, n_classes)
+        rows.append({"Model": "TCN", "Accuracy": acc, "Precision": prec, "Recall": rec, "F1-Score": f1, "ROC AUC": float("nan"), "FPR": fpr, "FNR": fnr})
+
+    if "growth_stage_autoencoder" in models:
+        x_t = torch.tensor(X_test_s.astype(np.float32), dtype=torch.float32)
+        with torch.no_grad():
+            _, logits = models["growth_stage_autoencoder"](x_t)
+            y_pred = torch.argmax(logits, dim=1).cpu().numpy().astype(int)
+        acc, prec, rec, f1, fpr, fnr = _classification_metrics(y_test, y_pred, n_classes)
+        rows.append({"Model": "Autoencoder", "Accuracy": acc, "Precision": prec, "Recall": rec, "F1-Score": f1, "ROC AUC": float("nan"), "FPR": fpr, "FNR": fnr})
+
+    return pd.DataFrame(rows) if rows else None
 
 @st.cache_data
 def load_data():
@@ -331,8 +735,51 @@ elif page == " pH Prediction":
                 df_input = pd.DataFrame([sensor_input])[features]
                 X_scaled = models['ph_scaler'].transform(df_input)
                 
-                # Predict
-                pred_ph = models['ph_tabnet'].predict(X_scaled)[0][0]
+                # Predict (select model)
+                available_models = []
+                if 'ph_tabnet' in models:
+                    available_models.append("TabNet")
+                if 'ph_lstm' in models:
+                    available_models.append("LSTM")
+                if 'ph_gru' in models:
+                    available_models.append("GRU")
+                if 'ph_tcn' in models:
+                    available_models.append("TCN")
+                if 'ph_autoencoder' in models:
+                    available_models.append("Autoencoder")
+
+                chosen = st.session_state.get("ph_model_choice", "TabNet")
+                if chosen not in available_models and available_models:
+                    chosen = available_models[0]
+
+                # Store choice UI (kept near prediction for clarity)
+                st.session_state["ph_model_choice"] = st.selectbox(
+                    "Model",
+                    available_models if available_models else ["TabNet"],
+                    index=(available_models.index(chosen) if chosen in available_models else 0),
+                    key="ph_model_choice_select",
+                )
+                chosen = st.session_state["ph_model_choice"]
+
+                if chosen == "TabNet":
+                    pred_ph = float(models['ph_tabnet'].predict(X_scaled)[0][0])
+                elif chosen == "LSTM":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        pred_ph = float(models["ph_lstm"](x_t).cpu().numpy().flatten()[0])
+                elif chosen == "GRU":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        pred_ph = float(models["ph_gru"](x_t).cpu().numpy().flatten()[0])
+                elif chosen == "TCN":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=5)
+                    with torch.no_grad():
+                        pred_ph = float(models["ph_tcn"](x_t).cpu().numpy().flatten()[0])
+                else:
+                    x_t = torch.tensor(X_scaled.astype(np.float32), dtype=torch.float32)
+                    with torch.no_grad():
+                        _, y_hat = models["ph_autoencoder"](x_t)
+                        pred_ph = float(y_hat.cpu().numpy().flatten()[0])
                 
                 st.success(f"### Predicted pH: **{pred_ph:.2f}**")
                 
@@ -645,10 +1092,50 @@ elif page == " NHI Estimation":
                 features = ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature', 'pH']
                 df_input = pd.DataFrame([sensor_input])[features]
                 X_scaled = models['nhi_scaler'].transform(df_input)
-                
-                pred_nhi = models['nhi_tabnet'].predict(X_scaled)[0][0]
-                # Convert to Python float for Streamlit progress bar
-                pred_nhi_float = float(pred_nhi)
+
+                available_models = []
+                if 'nhi_tabnet' in models:
+                    available_models.append("TabNet")
+                if 'nhi_lstm' in models:
+                    available_models.append("LSTM")
+                if 'nhi_gru' in models:
+                    available_models.append("GRU")
+                if 'nhi_tcn' in models:
+                    available_models.append("TCN")
+                if 'nhi_autoencoder' in models:
+                    available_models.append("Autoencoder")
+
+                chosen = st.session_state.get("nhi_model_choice", "TabNet")
+                if chosen not in available_models and available_models:
+                    chosen = available_models[0]
+
+                st.session_state["nhi_model_choice"] = st.selectbox(
+                    "Model",
+                    available_models if available_models else ["TabNet"],
+                    index=(available_models.index(chosen) if chosen in available_models else 0),
+                    key="nhi_model_choice_select",
+                )
+                chosen = st.session_state["nhi_model_choice"]
+
+                if chosen == "TabNet":
+                    pred_nhi_float = float(models['nhi_tabnet'].predict(X_scaled)[0][0])
+                elif chosen == "LSTM":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        pred_nhi_float = float(models["nhi_lstm"](x_t).cpu().numpy().flatten()[0])
+                elif chosen == "GRU":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        pred_nhi_float = float(models["nhi_gru"](x_t).cpu().numpy().flatten()[0])
+                elif chosen == "TCN":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=5)
+                    with torch.no_grad():
+                        pred_nhi_float = float(models["nhi_tcn"](x_t).cpu().numpy().flatten()[0])
+                else:
+                    x_t = torch.tensor(X_scaled.astype(np.float32), dtype=torch.float32)
+                    with torch.no_grad():
+                        _, y_hat = models["nhi_autoencoder"](x_t)
+                        pred_nhi_float = float(y_hat.cpu().numpy().flatten()[0])
                 
                 st.success(f"### Predicted NHI: **{pred_nhi_float:.2f}**")
                 
@@ -689,7 +1176,7 @@ elif page == " NHI Estimation":
                         
                         st.markdown("###  Data-Driven Recommendations")
                         
-                        if pred_nhi < 30:
+                        if pred_nhi_float < 30:
                             st.error(" **Critical: Very Low Nutrient Health**")
                             critical_pct = (df['NHI'] < 30).sum() / len(df) * 100
                             st.markdown(f"""
@@ -699,7 +1186,7 @@ elif page == " NHI Estimation":
                             - **Recommendation**: Based on {critical_pct:.0f}% of your samples being critical, immediate nutrient intervention is needed
                             - **Pattern**: Your dataset shows NHI ranges from {df['NHI'].min():.2f} to {df['NHI'].max():.2f}
                             """)
-                        elif pred_nhi < 60:
+                        elif pred_nhi_float < 60:
                             st.warning(" **Warning: Below Optimal Nutrient Levels**")
                             warning_pct = ((df['NHI'] >= 30) & (df['NHI'] < 60)).sum() / len(df) * 100
                             st.markdown(f"""
@@ -709,7 +1196,7 @@ elif page == " NHI Estimation":
                             - **Recommendation**: Based on {warning_pct:.0f}% of your samples in this range, consider nutrient supplementation
                             - **Pattern**: Your dataset shows NHI ranges from {df['NHI'].min():.2f} to {df['NHI'].max():.2f}
                             """)
-                        elif pred_nhi < 80:
+                        elif pred_nhi_float < 80:
                             st.info(" **Good: Adequate Nutrient Levels**")
                             good_pct = ((df['NHI'] >= 60) & (df['NHI'] < 80)).sum() / len(df) * 100
                             st.markdown(f"""
@@ -947,7 +1434,7 @@ elif page == " NHI Estimation":
 # ===============================
 # Growth Stage Classification Page
 # ===============================
-elif page == "🌿 Growth Stage Classification":
+elif page == " Growth Stage Classification" or page == "🌿 Growth Stage Classification":
     st.markdown('<div class="main-header"> Plant Growth Stage Classification</div>', unsafe_allow_html=True)
     
     if 'growth_stage_tabnet' not in models or 'growth_stage_scaler' not in models:
@@ -990,9 +1477,54 @@ elif page == "🌿 Growth Stage Classification":
                 features = ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature', 'pH']
                 df_input = pd.DataFrame([sensor_input])[features]
                 X_scaled = models['growth_stage_scaler'].transform(df_input)
-                
-                # TabNetClassifier.predict returns 1D array, not 2D
-                pred_encoded = models['growth_stage_tabnet'].predict(X_scaled)[0]
+
+                available_models = []
+                if 'growth_stage_tabnet' in models:
+                    available_models.append("TabNet")
+                if 'growth_stage_lstm' in models:
+                    available_models.append("LSTM")
+                if 'growth_stage_gru' in models:
+                    available_models.append("GRU")
+                if 'growth_stage_tcn' in models:
+                    available_models.append("TCN")
+                if 'growth_stage_autoencoder' in models:
+                    available_models.append("Autoencoder")
+
+                chosen = st.session_state.get("stage_model_choice", "TabNet")
+                if chosen not in available_models and available_models:
+                    chosen = available_models[0]
+
+                st.session_state["stage_model_choice"] = st.selectbox(
+                    "Model",
+                    available_models if available_models else ["TabNet"],
+                    index=(available_models.index(chosen) if chosen in available_models else 0),
+                    key="stage_model_choice_select",
+                )
+                chosen = st.session_state["stage_model_choice"]
+
+                if chosen == "TabNet":
+                    pred_encoded = int(models['growth_stage_tabnet'].predict(X_scaled)[0])
+                elif chosen == "LSTM":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        logits = models["growth_stage_lstm"](x_t)
+                        pred_encoded = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                elif chosen == "GRU":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
+                    with torch.no_grad():
+                        logits = models["growth_stage_gru"](x_t)
+                        pred_encoded = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                elif chosen == "TCN":
+                    x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=5)
+                    with torch.no_grad():
+                        logits = models["growth_stage_tcn"](x_t)
+                        pred_encoded = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                else:
+                    x_t = torch.tensor(X_scaled.astype(np.float32), dtype=torch.float32)
+                    with torch.no_grad():
+                        _, logits = models["growth_stage_autoencoder"](x_t)
+                        pred_encoded = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+
                 pred_stage = models['growth_stage_encoder'].inverse_transform([pred_encoded])[0]
                 
                 st.success(f"### Predicted Growth Stage: **{pred_stage}**")
@@ -1075,6 +1607,28 @@ elif page == "🌿 Growth Stage Classification":
             if os.path.exists(metrics_path):
                 metrics_df = pd.read_csv(metrics_path)
                 st.dataframe(metrics_df, use_container_width=True)
+
+                # Highlight key classification metrics for currently selected model (if available)
+                selected_name = st.session_state.get("stage_model_choice", "TabNet")
+                if "Model" in metrics_df.columns and selected_name in metrics_df["Model"].astype(str).tolist():
+                    row = metrics_df[metrics_df["Model"].astype(str) == str(selected_name)].iloc[0]
+                    cols = st.columns(4)
+                    if "ROC AUC" in metrics_df.columns:
+                        cols[0].metric("ROC AUC", f"{float(row['ROC AUC']):.2f}" if pd.notna(row["ROC AUC"]) else "—")
+                    if "Accuracy" in metrics_df.columns:
+                        cols[1].metric("Accuracy", f"{float(row['Accuracy']):.2f}")
+                    if "Precision" in metrics_df.columns:
+                        cols[2].metric("Precision", f"{float(row['Precision']):.2f}")
+                    if "Recall" in metrics_df.columns:
+                        cols[3].metric("Recall", f"{float(row['Recall']):.2f}")
+
+                    cols2 = st.columns(3)
+                    if "F1-Score" in metrics_df.columns:
+                        cols2[0].metric("F1-score", f"{float(row['F1-Score']):.2f}")
+                    if "FPR" in metrics_df.columns:
+                        cols2[1].metric("False Positive Rate (FPR)", f"{float(row['FPR']):.2f}" if pd.notna(row["FPR"]) else "—")
+                    if "FNR" in metrics_df.columns:
+                        cols2[2].metric("False Negative Rate (FNR)", f"{float(row['FNR']):.2f}" if pd.notna(row["FNR"]) else "—")
                 
                 imp_path = os.path.join(METRICS_DIR, "growth_stage_feature_importance.csv")
                 if os.path.exists(imp_path):
@@ -1084,7 +1638,12 @@ elif page == "🌿 Growth Stage Classification":
                     ax.set_title('Feature Importance')
                     st.pyplot(fig)
             else:
-                st.info("Run plantgrowthstageclassification.py to generate metrics")
+                metrics_df = _maybe_compute_growth_stage_metrics(df, models)
+                if metrics_df is not None and not metrics_df.empty:
+                    st.info("Metrics computed live from your dataset (no training script run).")
+                    st.dataframe(metrics_df, use_container_width=True)
+                else:
+                    st.info("Run plantgrowthstageclassification.py to generate metrics")
         
         # Visualizations
         if df is not None and 'growth_stage' in df.columns:

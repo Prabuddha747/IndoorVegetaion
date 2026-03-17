@@ -252,6 +252,96 @@ with torch.no_grad():
 torch.save(lstm_model.state_dict(), f"{MODELS_DIR}/nhi_lstm.pt")
 
 # ===============================
+# GRU Model
+# ===============================
+
+class GRURegressor(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        _, h = self.gru(x)
+        return self.fc(h[-1])
+
+gru_model = GRURegressor(X_tr_lstm.shape[2]).to(device)
+optimizer_gru = torch.optim.Adam(gru_model.parameters(), lr=0.001)
+
+X_tr_t = torch.tensor(X_tr_lstm, dtype=torch.float32).to(device)
+y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.float32).to(device)
+
+gru_model.train()
+for epoch in range(50):
+    optimizer_gru.zero_grad()
+    preds = gru_model(X_tr_t).squeeze()
+    loss = criterion(preds, y_tr_t)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(gru_model.parameters(), 1.0)
+    optimizer_gru.step()
+    if (epoch + 1) % 10 == 0:
+        print(f"[GRU] Epoch {epoch+1}/50, Loss: {loss.item():.4f}")
+
+gru_model.eval()
+X_te_t = torch.tensor(X_te_lstm, dtype=torch.float32).to(device)
+with torch.no_grad():
+    y_pred_gru = gru_model(X_te_t).cpu().numpy().flatten()
+
+torch.save(gru_model.state_dict(), f"{MODELS_DIR}/nhi_gru.pt")
+
+# ===============================
+# Autoencoder + Regressor (supervised)
+# ===============================
+
+class AutoencoderRegressor(nn.Module):
+    def __init__(self, input_dim, latent_dim=16, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+        self.head = nn.Linear(latent_dim, 1)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+        y_hat = self.head(z)
+        return x_hat, y_hat
+
+ae_model = AutoencoderRegressor(input_dim=X_train_s.shape[1]).to(device)
+opt_ae = torch.optim.Adam(ae_model.parameters(), lr=0.001)
+mse = nn.MSELoss()
+
+X_tr_ae = torch.tensor(X_train_s, dtype=torch.float32).to(device)
+y_tr_ae = torch.tensor(y_train.values, dtype=torch.float32).to(device)
+X_te_ae = torch.tensor(X_test_s, dtype=torch.float32).to(device)
+
+ae_model.train()
+alpha = 0.3
+for epoch in range(80):
+    opt_ae.zero_grad()
+    x_hat, y_hat = ae_model(X_tr_ae)
+    loss_recon = mse(x_hat, X_tr_ae)
+    loss_pred = mse(y_hat.squeeze(), y_tr_ae)
+    loss = loss_recon + alpha * loss_pred
+    loss.backward()
+    opt_ae.step()
+
+ae_model.eval()
+with torch.no_grad():
+    _, y_pred_ae_t = ae_model(X_te_ae)
+    y_pred_ae = y_pred_ae_t.cpu().numpy().flatten()
+
+torch.save(ae_model.state_dict(), f"{MODELS_DIR}/nhi_autoencoder.pt")
+
+# ===============================
 # TCN Model
 # ===============================
 
@@ -315,21 +405,27 @@ torch.save(tcn_model.state_dict(), f"{MODELS_DIR}/nhi_tcn.pt")
 # ===============================
 
 comparison_df = pd.DataFrame({
-    "Model": ["TabNet", "LSTM", "TCN"],
+    "Model": ["TabNet", "LSTM", "GRU", "TCN", "Autoencoder"],
     "MAE": [
         mean_absolute_error(y_test, y_pred_tabnet),
         mean_absolute_error(y_te_lstm, y_pred_lstm),
+        mean_absolute_error(y_te_lstm, y_pred_gru),
         mean_absolute_error(y_te_tcn, y_pred_tcn)
+        , mean_absolute_error(y_test, y_pred_ae)
     ],
     "RMSE": [
         np.sqrt(mean_squared_error(y_test, y_pred_tabnet)),
         np.sqrt(mean_squared_error(y_te_lstm, y_pred_lstm)),
+        np.sqrt(mean_squared_error(y_te_lstm, y_pred_gru)),
         np.sqrt(mean_squared_error(y_te_tcn, y_pred_tcn))
+        , np.sqrt(mean_squared_error(y_test, y_pred_ae))
     ],
     "R2": [
         r2_score(y_test, y_pred_tabnet),
         r2_score(y_te_lstm, y_pred_lstm),
+        r2_score(y_te_lstm, y_pred_gru),
         r2_score(y_te_tcn, y_pred_tcn)
+        , r2_score(y_test, y_pred_ae)
     ]
 })
 
@@ -353,9 +449,9 @@ imp_df.to_csv(f"{METRICS_DIR}/nhi_feature_importance.csv", index=False)
 plt.figure(figsize=(12, 5))
 metrics = ['MAE', 'RMSE', 'R2']
 x = np.arange(len(metrics))
-width = 0.25
+width = 0.17
 
-for i, model in enumerate(['TabNet', 'LSTM', 'TCN']):
+for i, model in enumerate(['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']):
     values = [
         comparison_df[comparison_df['Model'] == model]['MAE'].values[0],
         comparison_df[comparison_df['Model'] == model]['RMSE'].values[0],
@@ -373,10 +469,10 @@ plt.savefig(f"{PLOTS_DIR}/nhi_model_comparison.png", dpi=300)
 plt.close()
 
 # Prediction scatter plots
-fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-predictions = [y_pred_tabnet, y_pred_lstm, y_pred_tcn]
-targets = [y_test, y_te_lstm, y_te_tcn]
-model_names = ['TabNet', 'LSTM', 'TCN']
+fig, axes = plt.subplots(1, 5, figsize=(22, 4))
+predictions = [y_pred_tabnet, y_pred_lstm, y_pred_gru, y_pred_tcn, y_pred_ae]
+targets = [y_test, y_te_lstm, y_te_lstm, y_te_tcn, y_test]
+model_names = ['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']
 
 for i, (pred, target, name) in enumerate(zip(predictions, targets, model_names)):
     axes[i].scatter(target, pred, alpha=0.5)
@@ -429,17 +525,6 @@ def predict_nhi(sensor_input: dict):
     df_in = pd.DataFrame([sensor_input])[FEATURES]
     x = scaler.transform(df_in)
     return float(tabnet_nhi.predict(x)[0][0])
-
-# Generate dataset-specific insights
-try:
-    from data_insights import analyze_dataset_insights
-    print("\n" + "="*60)
-    print("Generating Dataset-Specific Insights...")
-    print("="*60)
-    insights = analyze_dataset_insights(df)
-    print("Dataset insights saved to:", os.path.join(METRICS_DIR, "dataset_insights.json"))
-except ImportError:
-    print("Note: data_insights module not available. Install required dependencies.")
 
 print("\n" + "="*60)
 print("NHI Prediction Analysis Complete!")
