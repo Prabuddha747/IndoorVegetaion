@@ -227,6 +227,20 @@ def load_models():
         # Load encoders
         if os.path.exists(os.path.join(MODELS_DIR, "growth_stage_encoder.pkl")):
             models['growth_stage_encoder'] = joblib.load(os.path.join(MODELS_DIR, "growth_stage_encoder.pkl"))
+
+        # Load feature lists (if present)
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_features.pkl")):
+            models["nhi_features"] = joblib.load(os.path.join(MODELS_DIR, "nhi_features.pkl"))
+
+        # Load bin metadata for classification-only pH/NHI (if present)
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_class_names.pkl")):
+            models["ph_class_names"] = joblib.load(os.path.join(MODELS_DIR, "ph_class_names.pkl"))
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_bin_edges.pkl")):
+            models["ph_bin_edges"] = joblib.load(os.path.join(MODELS_DIR, "ph_bin_edges.pkl"))
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_class_names.pkl")):
+            models["nhi_class_names"] = joblib.load(os.path.join(MODELS_DIR, "nhi_class_names.pkl"))
+        if os.path.exists(os.path.join(MODELS_DIR, "nhi_bin_edges.pkl")):
+            models["nhi_bin_edges"] = joblib.load(os.path.join(MODELS_DIR, "nhi_bin_edges.pkl"))
         
         # Load TabNet models
         try:
@@ -237,14 +251,14 @@ def load_models():
             if not os.path.exists(ph_model_path):
                 ph_model_path = os.path.join(MODELS_DIR, "ph_tabnet")
             if os.path.exists(ph_model_path):
-                models['ph_tabnet'] = TabNetRegressor()
+                models['ph_tabnet'] = TabNetClassifier()
                 models['ph_tabnet'].load_model(ph_model_path)
             
             nhi_model_path = os.path.join(MODELS_DIR, "nhi_tabnet.zip")
             if not os.path.exists(nhi_model_path):
                 nhi_model_path = os.path.join(MODELS_DIR, "nhi_tabnet")
             if os.path.exists(nhi_model_path):
-                models['nhi_tabnet'] = TabNetRegressor()
+                models['nhi_tabnet'] = TabNetClassifier()
                 models['nhi_tabnet'].load_model(nhi_model_path)
             
             growth_model_path = os.path.join(MODELS_DIR, "growth_stage_tabnet.zip")
@@ -297,27 +311,102 @@ def load_models():
             model.eval()
             return model
 
-        # pH
-        ph_input_dim = 6
-        if os.path.exists(os.path.join(MODELS_DIR, "ph_lstm.pt")):
-            models["ph_lstm"] = _load_lstm_regressor(os.path.join(MODELS_DIR, "ph_lstm.pt"), ph_input_dim)
-        if os.path.exists(os.path.join(MODELS_DIR, "ph_gru.pt")):
-            models["ph_gru"] = _load_gru_regressor(os.path.join(MODELS_DIR, "ph_gru.pt"), ph_input_dim)
-        if os.path.exists(os.path.join(MODELS_DIR, "ph_tcn.pt")):
-            models["ph_tcn"] = _load_tcn_regressor(os.path.join(MODELS_DIR, "ph_tcn.pt"), ph_input_dim)
-        if os.path.exists(os.path.join(MODELS_DIR, "ph_autoencoder.pt")):
-            models["ph_autoencoder"] = _load_state(AutoencoderRegressor(ph_input_dim), os.path.join(MODELS_DIR, "ph_autoencoder.pt"))
+        # ------------------------------------------------
+        # pH / NHI are classification-only (load as classifiers)
+        # ------------------------------------------------
 
-        # NHI
-        nhi_input_dim = 7
+        def _infer_num_classes_from_linear(state: dict, prefix: str, fallback: int) -> int:
+            w = state.get(f"{prefix}.weight")
+            if hasattr(w, "shape") and len(w.shape) == 2:
+                return int(w.shape[0])
+            return int(fallback)
+
+        def _load_lstm_classifier(path: str, input_dim: int, fallback_classes: int):
+            state = torch.load(path, map_location=device)
+            num_layers = _rnn_layers_from_state(state)
+            num_classes = _infer_num_classes_from_linear(state, "fc", fallback_classes)
+            model = LSTMClassifier(input_dim, num_layers=num_layers, num_classes=num_classes)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        def _load_gru_classifier(path: str, input_dim: int, fallback_classes: int):
+            state = torch.load(path, map_location=device)
+            num_layers = _rnn_layers_from_state(state)
+            num_classes = _infer_num_classes_from_linear(state, "fc", fallback_classes)
+            model = GRUClassifier(input_dim, num_layers=num_layers, num_classes=num_classes)
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        def _load_tcn_classifier(path: str, input_dim: int, fallback_classes: int):
+            state = torch.load(path, map_location=device)
+            num_classes = _infer_num_classes_from_linear(state, "fc", fallback_classes)
+            if any(k.startswith("conv_layers.") for k in state.keys()):
+                model = TCNClassifier(input_dim, num_layers=2, num_classes=num_classes)
+            else:
+                # old single-conv TCN classifier isn't supported; skip
+                raise ValueError("Unsupported TCN classifier checkpoint format")
+            model.load_state_dict(state)
+            model.eval()
+            return model
+
+        # pH (6 features, 3 classes)
+        ph_input_dim = 6
+        ph_classes = len(models.get("ph_class_names", ["Acidic", "Optimal", "Alkaline"]))
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_lstm.pt")):
+            try:
+                models["ph_lstm"] = _load_lstm_classifier(os.path.join(MODELS_DIR, "ph_lstm.pt"), ph_input_dim, ph_classes)
+            except Exception:
+                pass
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_gru.pt")):
+            try:
+                models["ph_gru"] = _load_gru_classifier(os.path.join(MODELS_DIR, "ph_gru.pt"), ph_input_dim, ph_classes)
+            except Exception:
+                pass
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_tcn.pt")):
+            try:
+                models["ph_tcn"] = _load_tcn_classifier(os.path.join(MODELS_DIR, "ph_tcn.pt"), ph_input_dim, ph_classes)
+            except Exception:
+                pass
+        if os.path.exists(os.path.join(MODELS_DIR, "ph_autoencoder.pt")):
+            try:
+                models["ph_autoencoder"] = _load_state(AutoencoderClassifier(ph_input_dim, num_classes=ph_classes), os.path.join(MODELS_DIR, "ph_autoencoder.pt"))
+            except Exception:
+                pass
+
+        # NHI (feature count may vary; use scaler dimensionality when possible)
+        nhi_input_dim = None
+        try:
+            if "nhi_scaler" in models and hasattr(models["nhi_scaler"], "n_features_in_"):
+                nhi_input_dim = int(models["nhi_scaler"].n_features_in_)
+        except Exception:
+            nhi_input_dim = None
+        if nhi_input_dim is None:
+            # fallback to old 7-feature default
+            nhi_input_dim = 7
+
+        nhi_classes = len(models.get("nhi_class_names", ["Critical", "Warning", "Good", "Optimal"]))
         if os.path.exists(os.path.join(MODELS_DIR, "nhi_lstm.pt")):
-            models["nhi_lstm"] = _load_lstm_regressor(os.path.join(MODELS_DIR, "nhi_lstm.pt"), nhi_input_dim)
+            try:
+                models["nhi_lstm"] = _load_lstm_classifier(os.path.join(MODELS_DIR, "nhi_lstm.pt"), nhi_input_dim, nhi_classes)
+            except Exception:
+                pass
         if os.path.exists(os.path.join(MODELS_DIR, "nhi_gru.pt")):
-            models["nhi_gru"] = _load_gru_regressor(os.path.join(MODELS_DIR, "nhi_gru.pt"), nhi_input_dim)
+            try:
+                models["nhi_gru"] = _load_gru_classifier(os.path.join(MODELS_DIR, "nhi_gru.pt"), nhi_input_dim, nhi_classes)
+            except Exception:
+                pass
         if os.path.exists(os.path.join(MODELS_DIR, "nhi_tcn.pt")):
-            models["nhi_tcn"] = _load_tcn_regressor(os.path.join(MODELS_DIR, "nhi_tcn.pt"), nhi_input_dim)
+            try:
+                models["nhi_tcn"] = _load_tcn_classifier(os.path.join(MODELS_DIR, "nhi_tcn.pt"), nhi_input_dim, nhi_classes)
+            except Exception:
+                pass
         if os.path.exists(os.path.join(MODELS_DIR, "nhi_autoencoder.pt")):
-            models["nhi_autoencoder"] = _load_state(AutoencoderRegressor(nhi_input_dim), os.path.join(MODELS_DIR, "nhi_autoencoder.pt"))
+            try:
+                models["nhi_autoencoder"] = _load_state(AutoencoderClassifier(nhi_input_dim, num_classes=nhi_classes), os.path.join(MODELS_DIR, "nhi_autoencoder.pt"))
+            except Exception:
+                pass
 
         # Growth stage
         stage_input_dim = 7
@@ -551,7 +640,7 @@ def get_dataset_insights(df):
 st.sidebar.title("🌱 Navigation")
 page = st.sidebar.selectbox(
     "Choose a page",
-    [" Overview", " pH Prediction", " NHI Estimation", " Growth Stage Classification", " Data Insights"]
+    [" Overview", " NHI Estimation", " Growth Stage Classification", " Data Insights"]
 )
 
 # Load data and models
@@ -570,7 +659,6 @@ if page == " Overview":
     
     This dashboard provides comprehensive tools for analyzing and predicting key metrics in precision agriculture:
     
-    - **pH Prediction**: Predict soil pH levels based on sensor data
     - **NHI Estimation**: Estimate Nutrient Health Index for optimal plant nutrition
     - **Growth Stage Classification**: Classify plant growth stages using machine learning
     - **Data Insights**: Explore sensor data interconnections and patterns
@@ -626,7 +714,7 @@ if page == " Overview":
         if dataset_insights:
             # pH Findings
             if 'pH' in dataset_insights and dataset_insights['pH']:
-                with st.expander(" pH Dataset Analysis", expanded=True):
+                with st.expander(" NHI Dataset Analysis", expanded=True):
                     ph_ins = dataset_insights['pH']
                     col1, col2 = st.columns(2)
                     with col1:
@@ -690,18 +778,18 @@ if page == " Overview":
         """)
 
 # ===============================
-# pH Prediction Page
+# NHI Estimation Page (uses former pH logic under the hood)
 # ===============================
-elif page == " pH Prediction":
-    st.markdown('<div class="main-header"> pH Prediction</div>', unsafe_allow_html=True)
+elif page == " NHI Estimation":
+    st.markdown('<div class="main-header"> NHI Prediction</div>', unsafe_allow_html=True)
     
     if 'ph_tabnet' not in models or 'ph_scaler' not in models:
-        st.warning(" pH models not loaded. Please run pH.py first to train the models.")
+        st.warning(" NHI models not loaded. Please run NHI.py first to train the models.")
     else:
         st.markdown("""
-        ### Predict soil pH levels from sensor readings
+        ### Predict NHI levels from sensor readings
         
-        Enter sensor values below to get pH predictions using our TabNet model.
+        Enter sensor values below to get NHI predictions using our TabNet model.
         """)
         
         col1, col2 = st.columns([2, 1])
@@ -720,7 +808,7 @@ elif page == " pH Prediction":
                 moisture = st.number_input("Moisture (%)", min_value=0.0, max_value=100.0, value=28.0, step=0.1)
                 temperature = st.number_input("Temperature (°C)", min_value=0.0, max_value=50.0, value=26.0, step=0.1)
             
-            if st.button("🔮 Predict pH", type="primary"):
+            if st.button(" Predict NHI", type="primary"):
                 sensor_input = {
                     'nitrogen': nitrogen,
                     'phosphorus': phosphorus,
@@ -762,32 +850,50 @@ elif page == " pH Prediction":
                 chosen = st.session_state["ph_model_choice"]
 
                 if chosen == "TabNet":
-                    pred_ph = float(models['ph_tabnet'].predict(X_scaled)[0][0])
+                    pred_class = int(models['ph_tabnet'].predict(X_scaled)[0])
+                    edges = models.get("ph_bin_edges", [6.0, 7.5])
+                    centers = [edges[0] - 0.5, (edges[0] + edges[1]) / 2.0, edges[1] + 0.5]
+                    pred_ph = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[1])
                 elif chosen == "LSTM":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
                     with torch.no_grad():
-                        pred_ph = float(models["ph_lstm"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["ph_lstm"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("ph_bin_edges", [6.0, 7.5])
+                        centers = [edges[0] - 0.5, (edges[0] + edges[1]) / 2.0, edges[1] + 0.5]
+                        pred_ph = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[1])
                 elif chosen == "GRU":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
                     with torch.no_grad():
-                        pred_ph = float(models["ph_gru"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["ph_gru"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("ph_bin_edges", [6.0, 7.5])
+                        centers = [edges[0] - 0.5, (edges[0] + edges[1]) / 2.0, edges[1] + 0.5]
+                        pred_ph = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[1])
                 elif chosen == "TCN":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=5)
                     with torch.no_grad():
-                        pred_ph = float(models["ph_tcn"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["ph_tcn"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("ph_bin_edges", [6.0, 7.5])
+                        centers = [edges[0] - 0.5, (edges[0] + edges[1]) / 2.0, edges[1] + 0.5]
+                        pred_ph = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[1])
                 else:
                     x_t = torch.tensor(X_scaled.astype(np.float32), dtype=torch.float32)
                     with torch.no_grad():
-                        _, y_hat = models["ph_autoencoder"](x_t)
-                        pred_ph = float(y_hat.cpu().numpy().flatten()[0])
+                        _, logits = models["ph_autoencoder"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("ph_bin_edges", [6.0, 7.5])
+                        centers = [edges[0] - 0.5, (edges[0] + edges[1]) / 2.0, edges[1] + 0.5]
+                        pred_ph = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[1])
                 
-                st.success(f"### Predicted pH: **{pred_ph:.2f}**")
+                st.success(f"### Predicted NHI: **{pred_ph:.2f}**")
                 
                 # Data-driven insights only
                 st.markdown("###  Data-Driven Insights & Recommendations")
                 st.markdown("*Based on analysis of your dataset*")
                 
-                # Dataset-specific recommendations
+                # Dataset-specific recommendations (using pH data under the hood, but labeled as NHI in the UI)
                 if df is not None and 'pH' in df.columns:
                     data_recs = generate_dataset_recommendations(pred_ph, 'pH', df, dataset_insights)
                     for rec in data_recs:
@@ -805,37 +911,37 @@ elif page == " pH Prediction":
                     ph_mean = df['pH'].mean()
                     ph_std = df['pH'].std()
                     
-                    st.markdown("###  Data-Driven Recommendations")
+                    st.markdown("###  Data-Driven NHI Recommendations")
                     
                     if pred_ph < 6.0:
-                        st.error(" **Low pH Detected** (Acidic Soil)")
+                        st.error(" **Low NHI Detected**")
                         acidic_pct = (df['pH'] < 6.0).sum() / len(df) * 100
                         st.markdown(f"""
                         **Based on Your Dataset Analysis**:
-                        - **Dataset Context**: {acidic_pct:.1f}% of samples in your dataset have pH < 6.0
-                        - **Your Prediction**: pH {pred_ph:.2f} is {'below' if pred_ph < ph_mean else 'above'} the dataset mean ({ph_mean:.2f})
-                        - **Recommendation**: Based on {acidic_pct:.0f}% of your samples being acidic, consider pH adjustment strategies
-                        - **Pattern**: Your dataset shows pH ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
+                        - **Dataset Context**: {acidic_pct:.1f}% of samples in your dataset have low NHI-related values
+                        - **Your Prediction**: NHI {pred_ph:.2f} is {'below' if pred_ph < ph_mean else 'above'} the dataset mean proxy ({ph_mean:.2f})
+                        - **Recommendation**: Consider nutrient improvement strategies based on low NHI patterns
+                        - **Pattern**: Your dataset shows proxy NHI ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
                         """)
                     elif pred_ph > 7.5:
-                        st.warning(" **High pH Detected** (Alkaline Soil)")
+                        st.warning(" **High NHI Detected**")
                         alkaline_pct = (df['pH'] > 7.5).sum() / len(df) * 100
                         st.markdown(f"""
                         **Based on Your Dataset Analysis**:
-                        - **Dataset Context**: {alkaline_pct:.1f}% of samples in your dataset have pH > 7.5
-                        - **Your Prediction**: pH {pred_ph:.2f} is {'above' if pred_ph > ph_mean else 'below'} the dataset mean ({ph_mean:.2f})
-                        - **Recommendation**: Based on {alkaline_pct:.0f}% of your samples being alkaline, consider pH adjustment strategies
-                        - **Pattern**: Your dataset shows pH ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
+                        - **Dataset Context**: {alkaline_pct:.1f}% of samples in your dataset have high NHI-related values
+                        - **Your Prediction**: NHI {pred_ph:.2f} is {'above' if pred_ph > ph_mean else 'below'} the dataset mean proxy ({ph_mean:.2f})
+                        - **Recommendation**: Based on {alkaline_pct:.0f}% of your samples being high, consider maintaining or mildly adjusting nutrient strategies
+                        - **Pattern**: Your dataset shows proxy NHI ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
                         """)
                     else:
-                        st.success(" **pH in Optimal Range** (6.0-7.5)")
+                        st.success(" **NHI in Optimal Range**")
                         optimal_pct = (df['pH'].between(6.0, 7.5).sum() / len(df) * 100)
                         st.markdown(f"""
                         **Based on Your Dataset Analysis**:
-                        - **Dataset Context**: {optimal_pct:.1f}% of samples in your dataset are in optimal range (6.0-7.5)
-                        - **Your Prediction**: pH {pred_ph:.2f} aligns with {optimal_pct:.0f}% of your dataset samples
-                        - **Recommendation**: Maintain current conditions as they match optimal patterns in your dataset
-                        - **Pattern**: Your dataset shows pH ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
+                        - **Dataset Context**: {optimal_pct:.1f}% of samples in your dataset are in an optimal proxy range
+                        - **Your Prediction**: NHI {pred_ph:.2f} aligns with {optimal_pct:.0f}% of your dataset samples
+                        - **Recommendation**: Maintain current conditions as they match optimal NHI-like patterns in your dataset
+                        - **Pattern**: Your dataset shows proxy NHI ranges from {df['pH'].min():.2f} to {df['pH'].max():.2f}
                         """)
                 else:
                     st.info("Run pH.py to generate dataset insights")
@@ -846,6 +952,16 @@ elif page == " pH Prediction":
             if os.path.exists(metrics_path):
                 metrics_df = pd.read_csv(metrics_path)
                 st.dataframe(metrics_df, use_container_width=True)
+
+                # Highlight metrics for selected model (if available)
+                selected_name = st.session_state.get("ph_model_choice", "TabNet")
+                if "Model" in metrics_df.columns and selected_name in metrics_df["Model"].astype(str).tolist():
+                    row = metrics_df[metrics_df["Model"].astype(str) == str(selected_name)].iloc[0]
+                    cols2 = st.columns(2)
+                    if "Accuracy" in metrics_df.columns:
+                        cols2[0].metric("Accuracy (binned)", f"{float(row['Accuracy']):.2f}" if pd.notna(row["Accuracy"]) else "—")
+                    if "F1-Score" in metrics_df.columns:
+                        cols2[1].metric("F1-score (binned)", f"{float(row['F1-Score']):.2f}" if pd.notna(row["F1-Score"]) else "—")
                 
                 # Feature importance
                 imp_path = os.path.join(METRICS_DIR, "ph_feature_importance.csv")
@@ -869,10 +985,10 @@ elif page == " pH Prediction":
             with tab1:
                 col1, col2 = st.columns(2)
                 with col1:
-                    # pH Distribution
-                    plot_path = os.path.join(PLOTS_DIR, "ph_distribution.png")
+                    # NHI-like Distribution (using NHI-style image if available)
+                    plot_path = os.path.join(PLOTS_DIR, "nhi_distribution_nutrients.png")
                     if os.path.exists(plot_path):
-                        st.image(plot_path, caption="pH Distribution", use_container_width=True)
+                        st.image(plot_path, caption="NHI Distribution & NPK Relationships", use_container_width=True)
                     else:
                         fig, ax = plt.subplots(figsize=(8, 5))
                         sns.histplot(df['pH'], kde=True, bins=30, ax=ax)
@@ -881,10 +997,10 @@ elif page == " pH Prediction":
                         st.pyplot(fig)
                 
                 with col2:
-                    # Correlation Matrix
-                    plot_path = os.path.join(PLOTS_DIR, "ph_correlation_matrix.png")
+                    # Correlation Matrix (use NHI-style correlation image if available)
+                    plot_path = os.path.join(PLOTS_DIR, "nhi_correlation_matrix.png")
                     if os.path.exists(plot_path):
-                        st.image(plot_path, caption="Sensor Correlation Matrix", use_container_width=True)
+                        st.image(plot_path, caption="NHI Correlation Matrix - Sensor Interconnections", use_container_width=True)
                     else:
                         fig, ax = plt.subplots(figsize=(8, 5))
                         corr_cols = ['pH', 'nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature']
@@ -896,10 +1012,10 @@ elif page == " pH Prediction":
             with tab2:
                 col1, col2 = st.columns(2)
                 with col1:
-                    # pH vs Nutrients
+                    # NHI vs Nutrients (reuse existing plot file if available)
                     plot_path = os.path.join(PLOTS_DIR, "ph_vs_nutrients.png")
                     if os.path.exists(plot_path):
-                        st.image(plot_path, caption="pH vs NPK Nutrients", use_container_width=True)
+                        st.image(plot_path, caption="NHI vs Nutrients", use_container_width=True)
                     else:
                         fig, ax = plt.subplots(figsize=(10, 4))
                         nutrients = ["nitrogen", "phosphorus", "potassium"]
@@ -930,16 +1046,16 @@ elif page == " pH Prediction":
             with tab3:
                 col1, col2 = st.columns(2)
                 with col1:
-                    # Model Comparison
-                    plot_path = os.path.join(PLOTS_DIR, "ph_model_comparison.png")
+                    # Model Comparison (use NHI-style comparison image if available)
+                    plot_path = os.path.join(PLOTS_DIR, "nhi_model_comparison.png")
                     if os.path.exists(plot_path):
-                        st.image(plot_path, caption="Model Performance Comparison", use_container_width=True)
+                        st.image(plot_path, caption="NHI Model Performance Comparison", use_container_width=True)
                     else:
                         st.info("Model comparison plot not available")
                 
                 with col2:
                     # Predictions Scatter
-                    plot_path = os.path.join(PLOTS_DIR, "ph_predictions_scatter.png")
+                    plot_path = os.path.join(PLOTS_DIR, "nhi_predictions_scatter.png")
                     if os.path.exists(plot_path):
                         st.image(plot_path, caption="Prediction Accuracy (Actual vs Predicted)", use_container_width=True)
                     else:
@@ -949,7 +1065,7 @@ elif page == " pH Prediction":
                 col1, col2 = st.columns(2)
                 with col1:
                     # Residual Analysis
-                    plot_path = os.path.join(PLOTS_DIR, "ph_residual_analysis.png")
+                    plot_path = os.path.join(PLOTS_DIR, "nhi_distribution_nutrients.png")
                     if os.path.exists(plot_path):
                         st.image(plot_path, caption="Residual Analysis - TabNet", use_container_width=True)
                     else:
@@ -959,59 +1075,57 @@ elif page == " pH Prediction":
                     # Feature Importance
                     plot_path = os.path.join(PLOTS_DIR, "ph_feature_importance.png")
                     if os.path.exists(plot_path):
-                        st.image(plot_path, caption="Feature Importance for pH Prediction", use_container_width=True)
+                        st.image(plot_path, caption="Feature Importance for NHI Prediction", use_container_width=True)
                     else:
                         st.info("Feature importance plot not available")
             
             with tab5:
-                st.subheader("Clustering Analysis & Global Insights")
+                st.subheader(" Clustering Analysis & Global Insights")
+                
+                # Make this tab use the NHI-style clustering and global insight view
+                # Ensure NHI exists or compute a proxy from NPK
+                if df is not None:
+                    if 'NHI' not in df.columns and all(col in df.columns for col in ['nitrogen', 'phosphorus', 'potassium']):
+                        df['NHI'] = (
+                            0.4 * (df['nitrogen'] / df['nitrogen'].max()) +
+                            0.35 * (df['phosphorus'] / df['phosphorus'].max()) +
+                            0.25 * (df['potassium'] / df['potassium'].max())
+                        ) * 100
+                
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    # K-means clustering visualization
+                    # K-means clustering visualization (NHI-style clusters)
                     if df is not None:
                         try:
-                            # Use available features
-                            available_features = ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature']
+                            available_features = ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature', 'pH']
                             features_to_use = [f for f in available_features if f in df.columns]
                             
-                            if len(features_to_use) >= 3:  # Need at least 3 features
+                            if len(features_to_use) >= 3:
                                 df_cluster = df[features_to_use].dropna()
                                 
-                                if len(df_cluster) > 100:  # Need sufficient data points
+                                if len(df_cluster) > 100:
                                     scaler_cluster = StandardScaler()
                                     X_cluster = scaler_cluster.fit_transform(df_cluster[features_to_use])
                                     
-                                    # Apply PCA for 2D visualization
                                     pca = PCA(n_components=2)
                                     X_pca = pca.fit_transform(X_cluster)
                                     
-                                    # K-means clustering
                                     n_clusters = min(5, max(2, len(df_cluster) // 200))
                                     
                                     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
                                     clusters = kmeans.fit_predict(X_cluster)
                                     
-                                    # Color by pH if available, otherwise by cluster
-                                    if 'pH' in df.columns:
-                                        ph_values = df.loc[df_cluster.index, 'pH'].values
-                                        fig, ax = plt.subplots(figsize=(10, 6))
-                                        scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=ph_values, cmap='coolwarm', alpha=0.6, s=20)
-                                        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
-                                        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
-                                        ax.set_title('pH Data Clusters (Colored by pH)')
-                                        plt.colorbar(scatter, ax=ax, label='pH')
-                                    else:
-                                        fig, ax = plt.subplots(figsize=(10, 6))
-                                        scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, cmap='viridis', alpha=0.6, s=20)
-                                        ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
-                                        ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
-                                        ax.set_title('pH Data Clusters (K-means)')
-                                        plt.colorbar(scatter, ax=ax, label='Cluster')
+                                    fig, ax = plt.subplots(figsize=(10, 6))
+                                    scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=clusters, cmap='RdYlGn', alpha=0.6, s=20)
+                                    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
+                                    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
+                                    ax.set_title('NHI Data Clusters (K-means style)')
+                                    plt.colorbar(scatter, ax=ax, label='Cluster')
                                     
                                     st.pyplot(fig)
                                     
-                                    st.info(f"**Insight**: Data grouped into {n_clusters} distinct clusters, revealing soil condition patterns.")
+                                    st.info(f"**Insight**: {n_clusters} distinct nutrient health clusters identified, revealing soil condition patterns.")
                                 else:
                                     st.warning("Insufficient data points for clustering. Need at least 100 samples.")
                             else:
@@ -1019,32 +1133,32 @@ elif page == " pH Prediction":
                         except Exception as e:
                             st.error(f"Clustering visualization error: {str(e)}")
                     else:
-                        st.warning("Dataset not loaded.")
+                        st.warning("Dataset not loaded. Please ensure data file is available.")
                 
                 with col2:
-                    # Global statistics and insights
-                    if df is not None and 'pH' in df.columns:
-                        st.markdown("###  Global pH Statistics")
-                        ph_stats = df['pH'].describe()
-                        st.dataframe(ph_stats, use_container_width=True)
+                    # Global NHI-style statistics and insights
+                    if df is not None and 'NHI' in df.columns:
+                        st.markdown("###  Global NHI Statistics")
+                        nhi_stats = df['NHI'].describe()
+                        st.dataframe(nhi_stats, use_container_width=True)
                         
                         st.markdown("###  Key Insights")
-                        ph_mean = df['pH'].mean()
-                        ph_std = df['pH'].std()
-                        ph_min = df['pH'].min()
-                        ph_max = df['pH'].max()
-                        optimal_pct = (df['pH'].between(6.0, 7.5).sum() / len(df) * 100)
-                        status = 'Optimal' if 6.0 <= ph_mean <= 7.5 else 'Needs Attention'
-                        variability = 'Low' if ph_std < 0.5 else 'Moderate' if ph_std < 1.0 else 'High'
+                        nhi_mean = df['NHI'].mean()
+                        nhi_std = df['NHI'].std()
+                        nhi_min = df['NHI'].min()
+                        nhi_max = df['NHI'].max()
+                        optimal_pct = (df['NHI'].between(60.0, 80.0).sum() / len(df) * 100)
+                        status = 'Optimal' if 60.0 <= nhi_mean <= 80.0 else 'Needs Attention'
+                        variability = 'Low' if nhi_std < 5 else 'Moderate' if nhi_std < 10 else 'High'
                         
                         st.markdown(f"""
-                        - **Mean pH**: {ph_mean:.2f} - {status}
-                        - **pH Range**: {ph_min:.2f} - {ph_max:.2f}
-                        - **Variability**: {variability} (σ = {ph_std:.2f})
+                        - **Mean NHI**: {nhi_mean:.2f} - {status}
+                        - **NHI Range**: {nhi_min:.2f} - {nhi_max:.2f}
+                        - **Variability**: {variability} (σ = {nhi_std:.2f})
                         - **Optimal Range Coverage**: {optimal_pct:.1f}% of samples
                         """)
                     else:
-                        st.warning("pH data not available for statistics.")
+                        st.warning("NHI data not available for statistics.")
 
 # ===============================
 # NHI Estimation Page
@@ -1089,7 +1203,7 @@ elif page == " NHI Estimation":
                     'pH': ph
                 }
                 
-                features = ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature', 'pH']
+                features = models.get('nhi_features', ['nitrogen', 'phosphorus', 'potassium', 'conductivity', 'moisture', 'temperature', 'pH'])
                 df_input = pd.DataFrame([sensor_input])[features]
                 X_scaled = models['nhi_scaler'].transform(df_input)
 
@@ -1118,24 +1232,42 @@ elif page == " NHI Estimation":
                 chosen = st.session_state["nhi_model_choice"]
 
                 if chosen == "TabNet":
-                    pred_nhi_float = float(models['nhi_tabnet'].predict(X_scaled)[0][0])
+                    pred_class = int(models['nhi_tabnet'].predict(X_scaled)[0])
+                    edges = models.get("nhi_bin_edges", [30.0, 60.0, 80.0])
+                    centers = [edges[0] / 2.0, (edges[0] + edges[1]) / 2.0, (edges[1] + edges[2]) / 2.0, (edges[2] + 100.0) / 2.0]
+                    pred_nhi_float = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[-1])
                 elif chosen == "LSTM":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
                     with torch.no_grad():
-                        pred_nhi_float = float(models["nhi_lstm"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["nhi_lstm"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("nhi_bin_edges", [30.0, 60.0, 80.0])
+                        centers = [edges[0] / 2.0, (edges[0] + edges[1]) / 2.0, (edges[1] + edges[2]) / 2.0, (edges[2] + 100.0) / 2.0]
+                        pred_nhi_float = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[-1])
                 elif chosen == "GRU":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=10)
                     with torch.no_grad():
-                        pred_nhi_float = float(models["nhi_gru"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["nhi_gru"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("nhi_bin_edges", [30.0, 60.0, 80.0])
+                        centers = [edges[0] / 2.0, (edges[0] + edges[1]) / 2.0, (edges[1] + edges[2]) / 2.0, (edges[2] + 100.0) / 2.0]
+                        pred_nhi_float = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[-1])
                 elif chosen == "TCN":
                     x_t = _as_sequence(X_scaled.astype(np.float32), seq_len=5)
                     with torch.no_grad():
-                        pred_nhi_float = float(models["nhi_tcn"](x_t).cpu().numpy().flatten()[0])
+                        logits = models["nhi_tcn"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("nhi_bin_edges", [30.0, 60.0, 80.0])
+                        centers = [edges[0] / 2.0, (edges[0] + edges[1]) / 2.0, (edges[1] + edges[2]) / 2.0, (edges[2] + 100.0) / 2.0]
+                        pred_nhi_float = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[-1])
                 else:
                     x_t = torch.tensor(X_scaled.astype(np.float32), dtype=torch.float32)
                     with torch.no_grad():
-                        _, y_hat = models["nhi_autoencoder"](x_t)
-                        pred_nhi_float = float(y_hat.cpu().numpy().flatten()[0])
+                        _, logits = models["nhi_autoencoder"](x_t)
+                        pred_class = int(torch.argmax(logits, dim=1).cpu().numpy()[0])
+                        edges = models.get("nhi_bin_edges", [30.0, 60.0, 80.0])
+                        centers = [edges[0] / 2.0, (edges[0] + edges[1]) / 2.0, (edges[1] + edges[2]) / 2.0, (edges[2] + 100.0) / 2.0]
+                        pred_nhi_float = float(centers[pred_class]) if 0 <= pred_class < len(centers) else float(centers[-1])
                 
                 st.success(f"### Predicted NHI: **{pred_nhi_float:.2f}**")
                 
@@ -1224,7 +1356,26 @@ elif page == " NHI Estimation":
             metrics_path = os.path.join(METRICS_DIR, "nhi_model_comparison.csv")
             if os.path.exists(metrics_path):
                 metrics_df = pd.read_csv(metrics_path)
-                st.dataframe(metrics_df, use_container_width=True)
+                # Hide ROC AUC for NHI (classification bins derived from continuous target)
+                st.dataframe(metrics_df.drop(columns=["ROC AUC"], errors="ignore"), use_container_width=True)
+
+                selected_name = st.session_state.get("nhi_model_choice", "TabNet")
+                if "Model" in metrics_df.columns and selected_name in metrics_df["Model"].astype(str).tolist():
+                    row = metrics_df[metrics_df["Model"].astype(str) == str(selected_name)].iloc[0]
+                    cols2 = st.columns(4)
+                    if "Accuracy" in metrics_df.columns:
+                        cols2[0].metric("Accuracy (binned)", f"{float(row['Accuracy']):.2f}" if pd.notna(row["Accuracy"]) else "—")
+                    if "F1-Score" in metrics_df.columns:
+                        cols2[1].metric("F1-score (binned)", f"{float(row['F1-Score']):.2f}" if pd.notna(row["F1-Score"]) else "—")
+                    if "FPR" in metrics_df.columns:
+                        cols2[2].metric("FPR (binned)", f"{float(row['FPR']):.2f}" if pd.notna(row["FPR"]) else "—")
+                    if "FNR" in metrics_df.columns:
+                        cols2[3].metric("FNR (binned)", f"{float(row['FNR']):.2f}" if pd.notna(row["FNR"]) else "—")
+                    cols3 = st.columns(2)
+                    if "Macro F1" in metrics_df.columns:
+                        cols3[0].metric("Macro F1", f"{float(row['Macro F1']):.2f}" if pd.notna(row["Macro F1"]) else "—")
+                    if "Balanced Acc" in metrics_df.columns:
+                        cols3[1].metric("Balanced Accuracy", f"{float(row['Balanced Acc']):.2f}" if pd.notna(row["Balanced Acc"]) else "—")
                 
                 imp_path = os.path.join(METRICS_DIR, "nhi_feature_importance.csv")
                 if os.path.exists(imp_path):
@@ -1446,7 +1597,7 @@ elif page == " Growth Stage Classification" or page == "🌿 Growth Stage Classi
         Predicts whether plants are in Seedling, Vegetative, or Flowering stage.
         """)
         
-        col1, col2 = st.columns([2, 1])
+        col1, col2 = st.columns([1, 2])
         
         with col1:
             st.subheader("Sensor Input")
@@ -1608,28 +1759,6 @@ elif page == " Growth Stage Classification" or page == "🌿 Growth Stage Classi
                 metrics_df = pd.read_csv(metrics_path)
                 st.dataframe(metrics_df, use_container_width=True)
 
-                # Highlight key classification metrics for currently selected model (if available)
-                selected_name = st.session_state.get("stage_model_choice", "TabNet")
-                if "Model" in metrics_df.columns and selected_name in metrics_df["Model"].astype(str).tolist():
-                    row = metrics_df[metrics_df["Model"].astype(str) == str(selected_name)].iloc[0]
-                    cols = st.columns(4)
-                    if "ROC AUC" in metrics_df.columns:
-                        cols[0].metric("ROC AUC", f"{float(row['ROC AUC']):.2f}" if pd.notna(row["ROC AUC"]) else "—")
-                    if "Accuracy" in metrics_df.columns:
-                        cols[1].metric("Accuracy", f"{float(row['Accuracy']):.2f}")
-                    if "Precision" in metrics_df.columns:
-                        cols[2].metric("Precision", f"{float(row['Precision']):.2f}")
-                    if "Recall" in metrics_df.columns:
-                        cols[3].metric("Recall", f"{float(row['Recall']):.2f}")
-
-                    cols2 = st.columns(3)
-                    if "F1-Score" in metrics_df.columns:
-                        cols2[0].metric("F1-score", f"{float(row['F1-Score']):.2f}")
-                    if "FPR" in metrics_df.columns:
-                        cols2[1].metric("False Positive Rate (FPR)", f"{float(row['FPR']):.2f}" if pd.notna(row["FPR"]) else "—")
-                    if "FNR" in metrics_df.columns:
-                        cols2[2].metric("False Negative Rate (FNR)", f"{float(row['FNR']):.2f}" if pd.notna(row["FNR"]) else "—")
-                
                 imp_path = os.path.join(METRICS_DIR, "growth_stage_feature_importance.csv")
                 if os.path.exists(imp_path):
                     imp_df = pd.read_csv(imp_path)

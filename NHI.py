@@ -31,16 +31,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, balanced_accuracy_score,
+    confusion_matrix, roc_auc_score
+)
 import joblib
 
 import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
 
-from pytorch_tabnet.tab_model import TabNetRegressor
+from pytorch_tabnet.tab_model import TabNetClassifier
 
 # ===============================
 # Data Loading & Exploration
@@ -54,6 +57,7 @@ print(f"\nColumns: {df.columns.tolist()}")
 print(f"\nMissing values:\n{df.isna().sum()}")
 
 # Calculate NHI if not present (weighted combination of NPK)
+nhi_was_synthetic = False
 if 'NHI' not in df.columns:
     # Normalize NPK values and create composite NHI score
     df['NHI'] = (
@@ -61,7 +65,60 @@ if 'NHI' not in df.columns:
         0.35 * (df['phosphorus'] / df['phosphorus'].max()) +
         0.25 * (df['potassium'] / df['potassium'].max())
     ) * 100
+    nhi_was_synthetic = True
     print("\nNHI calculated as weighted combination of NPK values")
+else:
+    # Some datasets store NHI normalized to ~[0, 3] or [0, 1]. Rescale to 0–100 for consistent bins/UI.
+    try:
+        nhi_max = float(pd.to_numeric(df["NHI"], errors="coerce").max())
+        if np.isfinite(nhi_max) and nhi_max <= 3.5:
+            df["NHI"] = pd.to_numeric(df["NHI"], errors="coerce") * 100.0
+            print(f"\nDetected low-range NHI (max={nhi_max:.3f}); rescaled NHI by ×100 to match 0–100 scale.")
+    except Exception:
+        pass
+
+
+def nhi_to_class(nhi_values: np.ndarray) -> np.ndarray:
+    # 0: Critical (<30), 1: Warning (30–60), 2: Good (60–80), 3: Optimal (>=80)
+    nhi_values = np.asarray(nhi_values, dtype=float)
+    return np.digitize(nhi_values, bins=[30.0, 60.0, 80.0], right=False)
+
+
+def nhi_to_class_with_edges(nhi_values: np.ndarray, edges: list[float]) -> np.ndarray:
+    # edges are internal cut points (len = n_classes-1)
+    nhi_values = np.asarray(nhi_values, dtype=float)
+    return np.digitize(nhi_values, bins=np.asarray(edges, dtype=float), right=False)
+
+
+# Class names for display
+NHI_CLASS_NAMES = ["Critical", "Warning", "Good", "Optimal"]
+
+
+def _fpr_fnr_macro(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> tuple[float, float]:
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+    fprs, fnrs = [], []
+    for c in range(n_classes):
+        tp = cm[c, c]
+        fn = cm[c, :].sum() - tp
+        fp = cm[:, c].sum() - tp
+        tn = cm.sum() - (tp + fn + fp)
+        fpr = (fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+        fnr = (fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+        fprs.append(fpr)
+        fnrs.append(fnr)
+    return float(np.mean(fprs)), float(np.mean(fnrs))
+
+
+def _approx_multiclass_auc_from_regression(pred: np.ndarray, y_true_cls: np.ndarray, centers: list[float]) -> float:
+    pred = np.asarray(pred, dtype=float).reshape(-1)
+    scores = np.stack([-np.abs(pred - c) for c in centers], axis=1)
+    scores = scores - scores.max(axis=1, keepdims=True)
+    probs = np.exp(scores)
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    try:
+        return float(roc_auc_score(y_true_cls, probs, multi_class="ovr", average="macro"))
+    except Exception:
+        return float("nan")
 
 # ===============================
 # Data Engineering & Visualizations
@@ -144,20 +201,27 @@ if 'date' in df.columns or 'timestamp' in df.columns:
 # Feature Engineering
 # ===============================
 
-FEATURES = [
+ALL_FEATURES = [
     "nitrogen", "phosphorus", "potassium",
     "conductivity", "moisture", "temperature", "pH"
 ]
+
+# If NHI is synthetic from NPK, using N/P/K as inputs makes the task trivial (leakage).
+# In that case, train a "no-leak" model using only environmental/context features.
+if "nhi_was_synthetic" in globals() and nhi_was_synthetic:
+    FEATURES = ["conductivity", "moisture", "temperature", "pH"]
+else:
+    FEATURES = ALL_FEATURES
 TARGET = "NHI"
 
 # Remove rows with missing target
 df_clean = df[FEATURES + [TARGET]].dropna()
 
 X = df_clean[FEATURES]
-y = df_clean[TARGET]
+y_cont = df_clean[TARGET]
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+X_train, X_test, y_train_cont, y_test_cont = train_test_split(
+    X, y_cont, test_size=0.2, random_state=42
 )
 
 scaler = StandardScaler()
@@ -165,33 +229,58 @@ X_train_s = scaler.fit_transform(X_train)
 X_test_s = scaler.transform(X_test)
 
 joblib.dump(scaler, f"{MODELS_DIR}/nhi_scaler.pkl")
+joblib.dump(FEATURES, f"{MODELS_DIR}/nhi_features.pkl")
 
 # ===============================
-# TabNet Model
+# TabNet Classifier
 # ===============================
 
 print("\n" + "="*60)
-print("Training TabNet for NHI Prediction...")
+print("Training TabNet Classifier for NHI...")
 print("="*60)
 
-tabnet_nhi = TabNetRegressor(
-    n_d=16, n_a=16, n_steps=5,
-    optimizer_params=dict(lr=0.02),
-    mask_type="entmax"
+tabnet_nhi = TabNetClassifier(
+    n_d=12, n_a=12, n_steps=4,
+    optimizer_params=dict(lr=0.01, weight_decay=1e-4),
+    mask_type="entmax",
+    lambda_sparse=1e-3
 )
+
+# Bin edges for classification evaluation/training
+fixed_edges = [30.0, 60.0, 80.0]
+bin_scheme = "fixed(30/60/80)"
+eval_edges = fixed_edges
+
+vals_all = np.asarray(y_train_cont.values, dtype=float)
+fixed_cls_all = nhi_to_class(vals_all)
+vals, counts = np.unique(fixed_cls_all, return_counts=True)
+max_frac = float(np.max(counts) / np.sum(counts)) if np.sum(counts) else 1.0
+
+if len(np.unique(fixed_cls_all)) < 2 or max_frac > 0.90:
+    # percentile bins (non-uniform)
+    ps = np.quantile(vals_all, [0.10, 0.40, 0.70]).tolist()
+    ps = sorted(list(dict.fromkeys([float(v) for v in ps])))
+    if len(ps) == 3:
+        eval_edges = ps
+        bin_scheme = f"percentiles({eval_edges[0]:.1f}/{eval_edges[1]:.1f}/{eval_edges[2]:.1f})"
+        print("\nNOTE: Fixed NHI bins are not informative. Using percentile bins for classifier:", bin_scheme)
+
+y_train = nhi_to_class_with_edges(y_train_cont.values, eval_edges).astype(int)
+y_test = nhi_to_class_with_edges(y_test_cont.values, eval_edges).astype(int)
 
 tabnet_nhi.fit(
     X_train_s,
-    y_train.values.reshape(-1, 1),
-    eval_set=[(X_test_s, y_test.values.reshape(-1, 1))],
+    y_train,
+    eval_set=[(X_test_s, y_test)],
     max_epochs=200,
     patience=30
 )
 
-y_pred_tabnet = tabnet_nhi.predict(X_test_s).flatten()
+y_pred_tabnet = tabnet_nhi.predict(X_test_s).astype(int)
+y_proba_tabnet = tabnet_nhi.predict_proba(X_test_s)
 
 # ===============================
-# LSTM Model
+# LSTM Classifier
 # ===============================
 
 print("\n" + "="*60)
@@ -202,7 +291,7 @@ def create_sequences(X, y, seq_len):
     Xs, ys = [], []
     for i in range(len(X) - seq_len):
         Xs.append(X[i:i+seq_len])
-        ys.append(y.iloc[i+seq_len] if hasattr(y, 'iloc') else y[i+seq_len])
+        ys.append(y[i+seq_len])
     return np.array(Xs), np.array(ys)
 
 SEQ_LEN_LSTM = 10
@@ -212,11 +301,11 @@ split = int(0.8 * len(X_seq))
 X_tr_lstm, X_te_lstm = X_seq[:split], X_seq[split:]
 y_tr_lstm, y_te_lstm = y_seq[:split], y_seq[split:]
 
-class LSTMRegressor(nn.Module):
-    def __init__(self, input_size, hidden=64, num_layers=2):
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2, num_classes=4):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden, 1)
+        self.fc = nn.Linear(hidden, num_classes)
 
     def forward(self, x):
         _, (h, _) = self.lstm(x)
@@ -225,19 +314,19 @@ class LSTMRegressor(nn.Module):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
-lstm_model = LSTMRegressor(X_tr_lstm.shape[2]).to(device)
-optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
-criterion = nn.MSELoss()
+lstm_model = LSTMClassifier(X_tr_lstm.shape[2], num_classes=len(NHI_CLASS_NAMES)).to(device)
+optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001, weight_decay=1e-4)
+criterion = nn.CrossEntropyLoss()
 
 X_tr_t = torch.tensor(X_tr_lstm, dtype=torch.float32).to(device)
-y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.float32).to(device)
+y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.long).to(device)
 
 # Training loop
 lstm_model.train()
-for epoch in range(50):
+for epoch in range(25):
     optimizer.zero_grad()
-    preds = lstm_model(X_tr_t).squeeze()
-    loss = criterion(preds, y_tr_t)
+    logits = lstm_model(X_tr_t)
+    loss = criterion(logits, y_tr_t)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(lstm_model.parameters(), 1.0)
     optimizer.step()
@@ -247,35 +336,37 @@ for epoch in range(50):
 lstm_model.eval()
 X_te_t = torch.tensor(X_te_lstm, dtype=torch.float32).to(device)
 with torch.no_grad():
-    y_pred_lstm = lstm_model(X_te_t).cpu().numpy().flatten()
+    logits = lstm_model(X_te_t)
+    y_proba_lstm = torch.softmax(logits, dim=1).cpu().numpy()
+    y_pred_lstm = np.argmax(y_proba_lstm, axis=1).astype(int)
 
 torch.save(lstm_model.state_dict(), f"{MODELS_DIR}/nhi_lstm.pt")
 
 # ===============================
-# GRU Model
+# GRU Classifier
 # ===============================
 
-class GRURegressor(nn.Module):
-    def __init__(self, input_size, hidden=64, num_layers=2):
+class GRUClassifier(nn.Module):
+    def __init__(self, input_size, hidden=64, num_layers=2, num_classes=4):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden, num_layers=num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden, 1)
+        self.fc = nn.Linear(hidden, num_classes)
 
     def forward(self, x):
         _, h = self.gru(x)
         return self.fc(h[-1])
 
-gru_model = GRURegressor(X_tr_lstm.shape[2]).to(device)
-optimizer_gru = torch.optim.Adam(gru_model.parameters(), lr=0.001)
+gru_model = GRUClassifier(X_tr_lstm.shape[2], num_classes=len(NHI_CLASS_NAMES)).to(device)
+optimizer_gru = torch.optim.Adam(gru_model.parameters(), lr=0.001, weight_decay=1e-4)
 
 X_tr_t = torch.tensor(X_tr_lstm, dtype=torch.float32).to(device)
-y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.float32).to(device)
+y_tr_t = torch.tensor(y_tr_lstm, dtype=torch.long).to(device)
 
 gru_model.train()
-for epoch in range(50):
+for epoch in range(25):
     optimizer_gru.zero_grad()
-    preds = gru_model(X_tr_t).squeeze()
-    loss = criterion(preds, y_tr_t)
+    logits = gru_model(X_tr_t)
+    loss = criterion(logits, y_tr_t)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(gru_model.parameters(), 1.0)
     optimizer_gru.step()
@@ -285,16 +376,18 @@ for epoch in range(50):
 gru_model.eval()
 X_te_t = torch.tensor(X_te_lstm, dtype=torch.float32).to(device)
 with torch.no_grad():
-    y_pred_gru = gru_model(X_te_t).cpu().numpy().flatten()
+    logits = gru_model(X_te_t)
+    y_proba_gru = torch.softmax(logits, dim=1).cpu().numpy()
+    y_pred_gru = np.argmax(y_proba_gru, axis=1).astype(int)
 
 torch.save(gru_model.state_dict(), f"{MODELS_DIR}/nhi_gru.pt")
 
 # ===============================
-# Autoencoder + Regressor (supervised)
+# Autoencoder + Classifier (supervised)
 # ===============================
 
-class AutoencoderRegressor(nn.Module):
-    def __init__(self, input_dim, latent_dim=16, hidden_dim=64):
+class AutoencoderClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes=4, latent_dim=16, hidden_dim=64):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -307,46 +400,48 @@ class AutoencoderRegressor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, input_dim),
         )
-        self.head = nn.Linear(latent_dim, 1)
+        self.head = nn.Linear(latent_dim, num_classes)
 
     def forward(self, x):
         z = self.encoder(x)
         x_hat = self.decoder(z)
-        y_hat = self.head(z)
-        return x_hat, y_hat
+        logits = self.head(z)
+        return x_hat, logits
 
-ae_model = AutoencoderRegressor(input_dim=X_train_s.shape[1]).to(device)
-opt_ae = torch.optim.Adam(ae_model.parameters(), lr=0.001)
+ae_model = AutoencoderClassifier(input_dim=X_train_s.shape[1], num_classes=len(NHI_CLASS_NAMES)).to(device)
+opt_ae = torch.optim.Adam(ae_model.parameters(), lr=0.001, weight_decay=1e-4)
 mse = nn.MSELoss()
+ce = nn.CrossEntropyLoss()
 
 X_tr_ae = torch.tensor(X_train_s, dtype=torch.float32).to(device)
-y_tr_ae = torch.tensor(y_train.values, dtype=torch.float32).to(device)
+y_tr_ae = torch.tensor(y_train, dtype=torch.long).to(device)
 X_te_ae = torch.tensor(X_test_s, dtype=torch.float32).to(device)
 
 ae_model.train()
 alpha = 0.3
-for epoch in range(80):
+for epoch in range(40):
     opt_ae.zero_grad()
-    x_hat, y_hat = ae_model(X_tr_ae)
+    x_hat, logits = ae_model(X_tr_ae)
     loss_recon = mse(x_hat, X_tr_ae)
-    loss_pred = mse(y_hat.squeeze(), y_tr_ae)
-    loss = loss_recon + alpha * loss_pred
+    loss_cls = ce(logits, y_tr_ae)
+    loss = loss_recon + alpha * loss_cls
     loss.backward()
     opt_ae.step()
 
 ae_model.eval()
 with torch.no_grad():
-    _, y_pred_ae_t = ae_model(X_te_ae)
-    y_pred_ae = y_pred_ae_t.cpu().numpy().flatten()
+    _, logits = ae_model(X_te_ae)
+    y_proba_ae = torch.softmax(logits, dim=1).cpu().numpy()
+    y_pred_ae = np.argmax(y_proba_ae, axis=1).astype(int)
 
 torch.save(ae_model.state_dict(), f"{MODELS_DIR}/nhi_autoencoder.pt")
 
 # ===============================
-# TCN Model
+# TCN Classifier
 # ===============================
 
 print("\n" + "="*60)
-print("Training TCN for NHI Prediction...")
+print("Training TCN Classifier for NHI...")
 print("="*60)
 
 SEQ_LEN_TCN = 5
@@ -356,8 +451,8 @@ split = int(0.8 * len(X_seq_tcn))
 X_tr_tcn, X_te_tcn = X_seq_tcn[:split], X_seq_tcn[split:]
 y_tr_tcn, y_te_tcn = y_seq_tcn[:split], y_seq_tcn[split:]
 
-class TCNRegressor(nn.Module):
-    def __init__(self, input_size, channels=64, kernel=3, num_layers=2):
+class TCNClassifier(nn.Module):
+    def __init__(self, input_size, channels=64, kernel=3, num_layers=2, num_classes=4):
         super().__init__()
         layers = []
         for i in range(num_layers):
@@ -367,7 +462,7 @@ class TCNRegressor(nn.Module):
             ))
             layers.append(nn.ReLU())
         self.conv_layers = nn.Sequential(*layers)
-        self.fc = nn.Linear(channels, 1)
+        self.fc = nn.Linear(channels, num_classes)
 
     def forward(self, x):
         x = x.permute(0, 2, 1)
@@ -375,18 +470,18 @@ class TCNRegressor(nn.Module):
         x = x.mean(dim=2)
         return self.fc(x)
 
-tcn_model = TCNRegressor(X_tr_tcn.shape[2]).to(device)
-optimizer = torch.optim.Adam(tcn_model.parameters(), lr=0.001)
+tcn_model = TCNClassifier(X_tr_tcn.shape[2], num_classes=len(NHI_CLASS_NAMES)).to(device)
+optimizer = torch.optim.Adam(tcn_model.parameters(), lr=0.001, weight_decay=1e-4)
 
 X_tr_t = torch.tensor(X_tr_tcn, dtype=torch.float32).to(device)
-y_tr_t = torch.tensor(y_tr_tcn, dtype=torch.float32).to(device)
+y_tr_t = torch.tensor(y_tr_tcn, dtype=torch.long).to(device)
 
 # Training loop
 tcn_model.train()
-for epoch in range(50):
+for epoch in range(25):
     optimizer.zero_grad()
-    preds = tcn_model(X_tr_t).squeeze()
-    loss = criterion(preds, y_tr_t)
+    logits = tcn_model(X_tr_t)
+    loss = criterion(logits, y_tr_t)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(tcn_model.parameters(), 1.0)
     optimizer.step()
@@ -396,141 +491,163 @@ for epoch in range(50):
 tcn_model.eval()
 X_te_t = torch.tensor(X_te_tcn, dtype=torch.float32).to(device)
 with torch.no_grad():
-    y_pred_tcn = tcn_model(X_te_t).cpu().numpy().flatten()
+    logits = tcn_model(X_te_t)
+    y_proba_tcn = torch.softmax(logits, dim=1).cpu().numpy()
+    y_pred_tcn = np.argmax(y_proba_tcn, axis=1).astype(int)
 
 torch.save(tcn_model.state_dict(), f"{MODELS_DIR}/nhi_tcn.pt")
 
-# ===============================
-# Model Evaluation & Comparison
-# ===============================
+
+n_nhi_classes = 4
+nhi_centers = [15.0, 45.0, 70.0, 90.0]  # representative points for Critical/Warning/Good/Optimal
+
+# If fixed bins collapse into 1 class OR are extremely imbalanced,
+# switch to percentile-based bins for evaluation so Accuracy/F1 are informative
+# without forcing perfectly uniform class counts.
+fixed_edges = [30.0, 60.0, 80.0]
+fixed_cls_all = nhi_to_class(y_train_cont.values)
+unique_fixed = np.unique(fixed_cls_all)
+
+bin_scheme = "fixed(30/60/80)"
+print("\nBinned NHI class distribution (train):", dict(zip(*np.unique(y_train, return_counts=True))))
+print("Binned NHI class distribution (test):", dict(zip(*np.unique(y_test, return_counts=True))))
+
+
+def _fpr_fnr_macro_from_cm(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+    fprs, fnrs = [], []
+    for c in range(n_classes):
+        tp = cm[c, c]
+        fn = cm[c, :].sum() - tp
+        fp = cm[:, c].sum() - tp
+        tn = cm.sum() - (tp + fn + fp)
+        fpr = (fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+        fnr = (fn / (fn + tp)) if (fn + tp) > 0 else 0.0
+        fprs.append(fpr)
+        fnrs.append(fnr)
+    return float(np.mean(fprs)), float(np.mean(fnrs))
+
+
+def _cls_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray | None, n_classes: int):
+    acc = float(accuracy_score(y_true, y_pred))
+    prec = float(precision_score(y_true, y_pred, average="weighted", zero_division=0))
+    rec = float(recall_score(y_true, y_pred, average="weighted", zero_division=0))
+    f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    fpr, fnr = _fpr_fnr_macro_from_cm(y_true, y_pred, n_classes=n_classes)
+    try:
+        auc = float(roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")) if y_proba is not None else float("nan")
+    except Exception:
+        auc = float("nan")
+    return acc, prec, rec, f1, auc, fpr, fnr
+
+
+def _tabnet_stratified_cv_summary(X_raw: pd.DataFrame, y_cls: np.ndarray, n_splits: int = 5):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    accs, f1_macros, bal_accs = [], [], []
+    for tr_idx, va_idx in skf.split(X_raw, y_cls):
+        x_tr = X_raw.iloc[tr_idx].values
+        x_va = X_raw.iloc[va_idx].values
+        y_tr = y_cls[tr_idx]
+        y_va = y_cls[va_idx]
+
+        sc = StandardScaler()
+        x_tr_s = sc.fit_transform(x_tr)
+        x_va_s = sc.transform(x_va)
+
+        m = TabNetClassifier(
+            n_d=8, n_a=8, n_steps=3,
+            optimizer_params=dict(lr=0.01, weight_decay=1e-4),
+            mask_type="entmax",
+            lambda_sparse=1e-3
+        )
+        m.fit(
+            x_tr_s, y_tr,
+            eval_set=[(x_va_s, y_va)],
+            max_epochs=60,
+            patience=10
+        )
+        pred = m.predict(x_va_s).astype(int)
+        accs.append(accuracy_score(y_va, pred))
+        f1_macros.append(f1_score(y_va, pred, average="macro", zero_division=0))
+        bal_accs.append(balanced_accuracy_score(y_va, pred))
+
+    return (
+        float(np.mean(accs)), float(np.std(accs)),
+        float(np.mean(f1_macros)), float(np.std(f1_macros)),
+        float(np.mean(bal_accs)), float(np.std(bal_accs)),
+    )
+
+
+n_classes = len(NHI_CLASS_NAMES)
+cls_tabnet = _cls_metrics(y_test, y_pred_tabnet, y_proba_tabnet, n_classes)
+cls_lstm = _cls_metrics(y_te_lstm.astype(int), y_pred_lstm.astype(int), y_proba_lstm, n_classes)
+cls_gru = _cls_metrics(y_te_lstm.astype(int), y_pred_gru.astype(int), y_proba_gru, n_classes)
+cls_tcn = _cls_metrics(y_te_tcn.astype(int), y_pred_tcn.astype(int), y_proba_tcn, n_classes)
+cls_ae = _cls_metrics(y_test, y_pred_ae.astype(int), y_proba_ae, n_classes)
+
+cv_acc_mean, cv_acc_std, cv_f1m_mean, cv_f1m_std, cv_bacc_mean, cv_bacc_std = _tabnet_stratified_cv_summary(
+    X, nhi_to_class_with_edges(y_cont.values, eval_edges).astype(int), n_splits=5
+)
 
 comparison_df = pd.DataFrame({
     "Model": ["TabNet", "LSTM", "GRU", "TCN", "Autoencoder"],
-    "MAE": [
-        mean_absolute_error(y_test, y_pred_tabnet),
-        mean_absolute_error(y_te_lstm, y_pred_lstm),
-        mean_absolute_error(y_te_lstm, y_pred_gru),
-        mean_absolute_error(y_te_tcn, y_pred_tcn)
-        , mean_absolute_error(y_test, y_pred_ae)
+    "Accuracy": [cls_tabnet[0], cls_lstm[0], cls_gru[0], cls_tcn[0], cls_ae[0]],
+    "Precision": [cls_tabnet[1], cls_lstm[1], cls_gru[1], cls_tcn[1], cls_ae[1]],
+    "Recall": [cls_tabnet[2], cls_lstm[2], cls_gru[2], cls_tcn[2], cls_ae[2]],
+    "F1-Score": [cls_tabnet[3], cls_lstm[3], cls_gru[3], cls_tcn[3], cls_ae[3]],
+    "Macro F1": [
+        f1_score(y_test, y_pred_tabnet, average="macro", zero_division=0),
+        f1_score(y_te_lstm.astype(int), y_pred_lstm.astype(int), average="macro", zero_division=0),
+        f1_score(y_te_lstm.astype(int), y_pred_gru.astype(int), average="macro", zero_division=0),
+        f1_score(y_te_tcn.astype(int), y_pred_tcn.astype(int), average="macro", zero_division=0),
+        f1_score(y_test, y_pred_ae.astype(int), average="macro", zero_division=0),
     ],
-    "RMSE": [
-        np.sqrt(mean_squared_error(y_test, y_pred_tabnet)),
-        np.sqrt(mean_squared_error(y_te_lstm, y_pred_lstm)),
-        np.sqrt(mean_squared_error(y_te_lstm, y_pred_gru)),
-        np.sqrt(mean_squared_error(y_te_tcn, y_pred_tcn))
-        , np.sqrt(mean_squared_error(y_test, y_pred_ae))
+    "Balanced Acc": [
+        balanced_accuracy_score(y_test, y_pred_tabnet),
+        balanced_accuracy_score(y_te_lstm.astype(int), y_pred_lstm.astype(int)),
+        balanced_accuracy_score(y_te_lstm.astype(int), y_pred_gru.astype(int)),
+        balanced_accuracy_score(y_te_tcn.astype(int), y_pred_tcn.astype(int)),
+        balanced_accuracy_score(y_test, y_pred_ae.astype(int)),
     ],
-    "R2": [
-        r2_score(y_test, y_pred_tabnet),
-        r2_score(y_te_lstm, y_pred_lstm),
-        r2_score(y_te_lstm, y_pred_gru),
-        r2_score(y_te_tcn, y_pred_tcn)
-        , r2_score(y_test, y_pred_ae)
-    ]
+    "ROC AUC": [cls_tabnet[4], cls_lstm[4], cls_gru[4], cls_tcn[4], cls_ae[4]],
+    "FPR": [cls_tabnet[5], cls_lstm[5], cls_gru[5], cls_tcn[5], cls_ae[5]],
+    "FNR": [cls_tabnet[6], cls_lstm[6], cls_gru[6], cls_tcn[6], cls_ae[6]],
+    "BinScheme": [bin_scheme] * 5,
+    "CV Accuracy (mean±std)": [
+        f"{cv_acc_mean:.4f}±{cv_acc_std:.4f}",
+        np.nan, np.nan, np.nan, np.nan
+    ],
+    "CV Macro F1 (mean±std)": [
+        f"{cv_f1m_mean:.4f}±{cv_f1m_std:.4f}",
+        np.nan, np.nan, np.nan, np.nan
+    ],
+    "CV Balanced Acc (mean±std)": [
+        f"{cv_bacc_mean:.4f}±{cv_bacc_std:.4f}",
+        np.nan, np.nan, np.nan, np.nan
+    ],
 })
 
 comparison_df.to_csv(f"{METRICS_DIR}/nhi_model_comparison.csv", index=False)
 print("\nModel Comparison:")
 print(comparison_df.to_string(index=False))
 
-# Feature importance
+# Feature importance (TabNet)
 imp_df = pd.DataFrame({
     "Feature": FEATURES,
     "Importance": tabnet_nhi.feature_importances_
 }).sort_values("Importance", ascending=False)
-
 imp_df.to_csv(f"{METRICS_DIR}/nhi_feature_importance.csv", index=False)
 
-# ===============================
-# Enhanced Visualizations
-# ===============================
-
-# Model comparison bar chart
-plt.figure(figsize=(12, 5))
-metrics = ['MAE', 'RMSE', 'R2']
-x = np.arange(len(metrics))
-width = 0.17
-
-for i, model in enumerate(['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']):
-    values = [
-        comparison_df[comparison_df['Model'] == model]['MAE'].values[0],
-        comparison_df[comparison_df['Model'] == model]['RMSE'].values[0],
-        comparison_df[comparison_df['Model'] == model]['R2'].values[0]
-    ]
-    plt.bar(x + i*width, values, width, label=model, alpha=0.8)
-
-plt.xlabel('Metrics')
-plt.ylabel('Score')
-plt.title('NHI Model Performance Comparison')
-plt.xticks(x + width, metrics)
-plt.legend()
-plt.tight_layout()
-plt.savefig(f"{PLOTS_DIR}/nhi_model_comparison.png", dpi=300)
-plt.close()
-
-# Prediction scatter plots
-fig, axes = plt.subplots(1, 5, figsize=(22, 4))
-predictions = [y_pred_tabnet, y_pred_lstm, y_pred_gru, y_pred_tcn, y_pred_ae]
-targets = [y_test, y_te_lstm, y_te_lstm, y_te_tcn, y_test]
-model_names = ['TabNet', 'LSTM', 'GRU', 'TCN', 'Autoencoder']
-
-for i, (pred, target, name) in enumerate(zip(predictions, targets, model_names)):
-    axes[i].scatter(target, pred, alpha=0.5)
-    axes[i].plot([target.min(), target.max()], [target.min(), target.max()], 'r--', lw=2)
-    axes[i].set_xlabel('Actual NHI')
-    axes[i].set_ylabel('Predicted NHI')
-    axes[i].set_title(f'{name} Predictions')
-    r2 = r2_score(target, pred)
-    axes[i].text(0.05, 0.95, f'R² = {r2:.3f}', transform=axes[i].transAxes, 
-                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-plt.tight_layout()
-plt.savefig(f"{PLOTS_DIR}/nhi_predictions_scatter.png", dpi=300)
-plt.close()
-
-# Feature importance
-plt.figure(figsize=(10, 6))
-sns.barplot(data=imp_df, x='Importance', y='Feature', palette='viridis')
-plt.title('Feature Importance for NHI Prediction (TabNet)')
-plt.xlabel('Importance Score')
-plt.tight_layout()
-plt.savefig(f"{PLOTS_DIR}/nhi_feature_importance.png", dpi=300)
-plt.close()
-
-# Residual analysis
-residuals_tabnet = y_test - y_pred_tabnet
-plt.figure(figsize=(10, 4))
-plt.subplot(1, 2, 1)
-plt.scatter(y_pred_tabnet, residuals_tabnet, alpha=0.5)
-plt.axhline(y=0, color='r', linestyle='--')
-plt.xlabel('Predicted NHI')
-plt.ylabel('Residuals')
-plt.title('Residual Plot - TabNet')
-
-plt.subplot(1, 2, 2)
-plt.hist(residuals_tabnet, bins=30, edgecolor='black')
-plt.xlabel('Residuals')
-plt.ylabel('Frequency')
-plt.title('Residual Distribution - TabNet')
-plt.tight_layout()
-plt.savefig(f"{PLOTS_DIR}/nhi_residual_analysis.png", dpi=300)
-plt.close()
-
-# Save model
+# Save model + bin metadata
 tabnet_nhi.save_model(f"{MODELS_DIR}/nhi_tabnet")
-
-# Prediction function
-def predict_nhi(sensor_input: dict):
-    """Predict NHI from sensor inputs"""
-    df_in = pd.DataFrame([sensor_input])[FEATURES]
-    x = scaler.transform(df_in)
-    return float(tabnet_nhi.predict(x)[0][0])
+joblib.dump(NHI_CLASS_NAMES, f"{MODELS_DIR}/nhi_class_names.pkl")
+joblib.dump(eval_edges, f"{MODELS_DIR}/nhi_bin_edges.pkl")
+joblib.dump(bin_scheme, f"{MODELS_DIR}/nhi_bin_scheme.pkl")
 
 print("\n" + "="*60)
-print("NHI Prediction Analysis Complete!")
+print("NHI Classification Analysis Complete!")
 print("="*60)
 print(f"\nResults saved to:")
-print(f"  - Plots: {PLOTS_DIR}")
 print(f"  - Metrics: {METRICS_DIR}")
 print(f"  - Models: {MODELS_DIR}")
 print("\nModel Performance Summary:")
